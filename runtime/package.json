@@ -1,0 +1,12 @@
+{
+  "name": "@metacall/function-runtime",
+  "version": "1.0.0",
+  "description": "Pod runtime server for MetaCall Function Mesh. Loads one script via MetaCall Core and serves its functions over HTTP.",
+  "main": "server.js",
+  "scripts": {
+    "start": "metacall node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  }
+}
