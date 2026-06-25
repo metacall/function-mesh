@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: function-mesh-router
+  namespace: metacall-system
+  labels:
+    app.kubernetes.io/name: function-mesh-router
+    metacall.io/component: router
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: function-mesh-router
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: function-mesh-router
+        metacall.io/component: router
+    spec:
+      serviceAccountName: function-mesh-router
+      containers:
+        - name: router
+          image: localhost:5000/metacall/function-mesh-router:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - --namespace=metacall-functions
+            - --listen=:9090
+          ports:
+            - name: http
+              containerPort: 9090
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: function-mesh-router
+  namespace: metacall-system
+  labels:
+    app.kubernetes.io/name: function-mesh-router
+    metacall.io/component: router
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: function-mesh-router
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http

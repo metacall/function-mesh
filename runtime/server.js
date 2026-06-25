@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('fs');
+const { execFileSync } = require('child_process');
 const express = require('express');
 const {
 	metacall_load_from_configuration,
@@ -13,6 +14,7 @@ const PORT = parseInt(process.env.PORT, 10) || 8080;
 const FUNCTION_CONFIG = process.env.FUNCTION_CONFIG;
 const RPC_CONFIG = process.env.RPC_CONFIG || '/mesh/metacall-rpc.json';
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS, 10) || 30000;
+const APP_DIR = process.env.APP_DIR || '/app';
 
 if (!FUNCTION_CONFIG) {
 	console.error('[runtime] FUNCTION_CONFIG env var is required.');
@@ -44,6 +46,33 @@ function loadFunctions(configPath) {
 	console.log(`[runtime] Loaded ${funcNames.length} local function(s): ${funcNames.join(', ')}`);
 	return exports;
 }
+
+function runIfPresent(fileName, command, args) {
+	const filePath = `${APP_DIR}/${fileName}`;
+	if (!fs.existsSync(filePath)) {
+		return;
+	}
+
+	console.log(`[runtime] Installing dependencies from ${fileName}`);
+	try {
+		execFileSync(command, args, {
+			cwd: APP_DIR,
+			stdio: 'inherit',
+			env: process.env,
+		});
+	} catch (err) {
+		console.error(`[runtime] Dependency install failed for ${fileName}: ${err.message}`);
+		process.exit(1);
+	}
+}
+
+function installDependencies() {
+	runIfPresent('package.json', 'npm', ['install', '--production', '--no-audit', '--no-fund']);
+	runIfPresent('requirements.txt', 'python3', ['-m', 'pip', 'install', '-r', 'requirements.txt']);
+	runIfPresent('Gemfile', 'bundle', ['install']);
+}
+
+installDependencies();
 
 const functions = loadFunctions(FUNCTION_CONFIG);
 const funcNames = Object.keys(functions);

@@ -1,6 +1,6 @@
 apiVersion: v2
 name: function-mesh
-description: MetaCall Function Mesh runtime chart
+description: MetaCall Function Mesh control plane
 
 # A chart can be either an 'application' or a 'library' chart.
 #

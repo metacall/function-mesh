@@ -1,0 +1,90 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: functions.metacall.io
+spec:
+  group: metacall.io
+  names:
+    kind: Function
+    listKind: FunctionList
+    plural: functions
+    shortNames:
+      - fn
+    singular: function
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required:
+                - language
+                - source
+              properties:
+                language:
+                  type: string
+                deployGroup:
+                  type: string
+                source:
+                  type: object
+                  required:
+                    - type
+                    - configMap
+                    - entrypoint
+                  properties:
+                    type:
+                      type: string
+                      enum:
+                        - configmap
+                    configMap:
+                      type: string
+                    entrypoint:
+                      type: string
+                runtime:
+                  type: object
+                  properties:
+                    replicas:
+                      type: integer
+                      format: int32
+                      minimum: 0
+                    resources:
+                      x-kubernetes-preserve-unknown-fields: true
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                serviceURL:
+                  type: string
+                functions:
+                  type: array
+                  items:
+                    type: string
+                podCount:
+                  type: integer
+                  format: int32
+      additionalPrinterColumns:
+        - name: Language
+          type: string
+          jsonPath: .spec.language
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: ServiceURL
+          type: string
+          jsonPath: .status.serviceURL
