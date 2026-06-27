@@ -48,6 +48,7 @@ type FunctionReconciler struct {
 	RuntimeImageRepository string
 	RuntimeImagePullPolicy corev1.PullPolicy
 	HTTPClient             *http.Client
+	L7Visibility           bool
 }
 
 func (r *FunctionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -113,10 +114,14 @@ func (r *FunctionReconciler) reconcileDeployment(ctx context.Context, fn *meshv1
 		deployment.Spec.Selector = &metav1.LabelSelector{MatchLabels: selectorLabels(fn)}
 		deployment.Spec.Template.Labels = mergeLabels(deployment.Spec.Template.Labels, functionLabels(fn))
 
-		// hashing the endpoints to trigger a redeploy when the endpoints change
-		deployment.Spec.Template.Annotations = mergeLabels(deployment.Spec.Template.Annotations, map[string]string{
+		annotations := map[string]string{
 			AnnotationEndpointsHash: hashEndpoints(r.generateEndpoints(ctx, fn)),
-		})
+		}
+		if r.L7Visibility {
+			annotations["policy.cilium.io/proxy-visibility"] = "<Ingress/8080/TCP/HTTP>,<Egress/8080/TCP/HTTP>"
+		}
+		// hashing the endpoints to trigger a redeploy when the endpoints change
+		deployment.Spec.Template.Annotations = mergeLabels(deployment.Spec.Template.Annotations, annotations)
 
 		deployment.Spec.Template.Spec.InitContainers = []corev1.Container{{
 			Name:            "stage-source",
@@ -348,8 +353,12 @@ func functionLabels(fn *meshv1.Function) map[string]string {
 	labels := selectorLabels(fn)
 	labels[LabelLanguage] = fn.Spec.Language
 	labels[LabelComponent] = "function"
+	labels["app.kubernetes.io/name"] = fn.Name
+	labels["app.kubernetes.io/instance"] = fn.Name
+	labels["app.kubernetes.io/component"] = fn.Spec.Language
 	if fn.Spec.DeployGroup != "" {
 		labels[LabelDeployGroup] = fn.Spec.DeployGroup
+		labels["app.kubernetes.io/part-of"] = fn.Spec.DeployGroup
 	}
 	return labels
 }

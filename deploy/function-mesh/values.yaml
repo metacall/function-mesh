@@ -38,3 +38,9 @@ router:
     type: ClusterIP
     port: 9090
   resources: {}
+
+cilium:
+  enabled: true
+  hubble:
+    enabled: true
+    l7Visibility: false

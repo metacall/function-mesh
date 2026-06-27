@@ -16,6 +16,10 @@ spec:
       labels:
         app.kubernetes.io/name: function-mesh-router
         metacall.io/component: router
+      {{- if and .Values.cilium.enabled .Values.cilium.hubble.l7Visibility }}
+      annotations:
+        policy.cilium.io/proxy-visibility: "<Ingress/9090/TCP/HTTP>,<Egress/8080/TCP/HTTP>"
+      {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:

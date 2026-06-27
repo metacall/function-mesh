@@ -28,11 +28,13 @@ func main() {
 	var probeAddr string
 	var runtimeImage string
 	var leaderElect bool
+	var l7Visibility bool
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.StringVar(&runtimeImage, "runtime-image", "localhost:5000/metacall/function", "Runtime image repository used for Function pods.")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "Enable leader election for controller manager.")
+	flag.BoolVar(&l7Visibility, "l7-visibility", false, "Enable L7 proxy visibility for Hubble.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -55,6 +57,7 @@ func main() {
 		Client:                 mgr.GetClient(),
 		Scheme:                 mgr.GetScheme(),
 		RuntimeImageRepository: runtimeImage,
+		L7Visibility:           l7Visibility,
 	}).SetupWithManager(mgr); err != nil {
 		ctrl.Log.Error(err, "unable to create Function controller")
 		os.Exit(1)

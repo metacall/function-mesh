@@ -8,7 +8,8 @@ WORKDIR /runtime
 COPY package.json ./
 RUN apt-get update && apt-get install -y npm \
     && npm install --production --no-audit --no-fund \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && (ln -s /usr/lib/x86_64-linux-gnu/libruby-3.3.so.3.3 /usr/lib/x86_64-linux-gnu/libruby-3.3.so 2>/dev/null || true)
 
 # Copy the server
 COPY server.js ./

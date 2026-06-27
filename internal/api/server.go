@@ -282,15 +282,31 @@ func (s *Server) handleDeployLogs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	tailLines := int64(200)
+	sinceSeconds := int64(3600)
 	var logs strings.Builder
 	for _, pod := range pods.Items {
-		stream, err := s.Clientset.CoreV1().Pods(s.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{}).Stream(r.Context())
+		// Skip pods that aren't running yet — no logs to read
+		if pod.Status.Phase != corev1.PodRunning && pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
+			_, _ = fmt.Fprintf(&logs, "==> %s [%s]\n", pod.Name, pod.Status.Phase)
+			continue
+		}
+
+		// Use a per-pod timeout so one stuck pod doesn't block the entire request
+		podCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		stream, err := s.Clientset.CoreV1().Pods(s.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+			TailLines:    &tailLines,
+			SinceSeconds: &sinceSeconds,
+		}).Stream(podCtx)
 		if err != nil {
+			cancel()
 			continue
 		}
 		_, _ = fmt.Fprintf(&logs, "==> %s\n", pod.Name)
 		_, _ = io.Copy(&logs, stream)
 		_ = stream.Close()
+		cancel()
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"logs": logs.String()})
 }
@@ -598,7 +614,9 @@ func inspectDeployments(functions []meshv1.Function) []map[string]any {
 			item = &group{status: "ready", ports: []int{8080}, packages: map[string][]map[string]any{}}
 			groups[suffix] = item
 		}
-		if fn.Status.Phase != "Running" {
+		if fn.Status.Phase == "Failed" {
+			item.status = "failed"
+		} else if fn.Status.Phase != "Running" && item.status != "failed" {
 			item.status = "create"
 		}
 		funcs := make([]map[string]any, 0, len(fn.Status.Functions))

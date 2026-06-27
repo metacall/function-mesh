@@ -16,6 +16,10 @@ spec:
       labels:
         app.kubernetes.io/name: function-mesh-api
         metacall.io/component: api
+      {{- if and .Values.cilium.enabled .Values.cilium.hubble.l7Visibility }}
+      annotations:
+        policy.cilium.io/proxy-visibility: "<Ingress/9000/TCP/HTTP>,<Egress/9090/TCP/HTTP>"
+      {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:

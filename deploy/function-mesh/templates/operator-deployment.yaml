@@ -14,6 +14,11 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: function-mesh-operator
+        metacall.io/component: operator
+      {{- if and .Values.cilium.enabled .Values.cilium.hubble.l7Visibility }}
+      annotations:
+        policy.cilium.io/proxy-visibility: "<Ingress/8080/TCP/HTTP>,<Ingress/8081/TCP/HTTP>,<Egress/8080/TCP/HTTP>"
+      {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -28,6 +33,7 @@ spec:
             - --runtime-image={{ .Values.runtime.imageRepository }}
             - --metrics-bind-address=:8080
             - --health-probe-bind-address=:8081
+            - --l7-visibility={{ .Values.cilium.hubble.l7Visibility }}
           ports:
             - name: metrics
               containerPort: 8080

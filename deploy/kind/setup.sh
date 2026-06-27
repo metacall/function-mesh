@@ -20,12 +20,35 @@ else
 fi
 
 docker network connect kind "${REGISTRY_NAME}" 2>/dev/null || true
-cilium install --version 1.16.0 \
-  --set kubeProxyReplacement=true \
-  --set k8sServiceHost="${CLUSTER_NAME}-control-plane" \
-  --set k8sServicePort=6443
+
+
+CILIUM_VERSION="${CILIUM_VERSION:-1.16.0}"
+CILIUM_ENVOY_TAG="${CILIUM_ENVOY_TAG:-v1.29.7-39a2a56bbd5b3a591f69dbca51d3e30ef97e0e51}"
+HUBBLE_UI_VERSION="${HUBBLE_UI_VERSION:-0.13.1}"
+CILIUM_IMAGES=(
+  "quay.io/cilium/cilium:v${CILIUM_VERSION}"
+  "quay.io/cilium/operator-generic:v${CILIUM_VERSION}"
+  "quay.io/cilium/cilium-envoy:${CILIUM_ENVOY_TAG}"
+  "quay.io/cilium/hubble-relay:v${CILIUM_VERSION}"
+  "quay.io/cilium/hubble-ui:v${HUBBLE_UI_VERSION}"
+  "quay.io/cilium/hubble-ui-backend:v${HUBBLE_UI_VERSION}"
+)
+echo "Pre-pulling Cilium/Hubble images..."
+for img in "${CILIUM_IMAGES[@]}"; do
+  docker pull "${img}" || true
+done
+echo "Loading images into kind cluster..."
+kind load docker-image --name "${CLUSTER_NAME}" "${CILIUM_IMAGES[@]}"
+
+if cilium status --wait=false >/dev/null 2>&1; then
+  echo "Cilium already installed, skipping install"
+else
+  cilium install --version "${CILIUM_VERSION}" \
+    --set kubeProxyReplacement=true \
+    --set k8sServiceHost="${CLUSTER_NAME}-control-plane" \
+    --set k8sServicePort=6443
+fi
 cilium status --wait
 cilium hubble enable --ui
-kubectl create namespace metacall-functions --dry-run=client -o yaml | kubectl apply -f -
-kubectl create namespace metacall-system --dry-run=client -o yaml | kubectl apply -f -
+cilium status --wait
 echo "Cluster ready. Registry at localhost:5000"
