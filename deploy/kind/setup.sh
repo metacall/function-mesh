@@ -51,4 +51,17 @@ fi
 cilium status --wait
 cilium hubble enable --ui
 cilium status --wait
+
+echo "Installing NGINX Ingress Controller..."
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+
+echo "Patching Ingress Controller to run on ingress-ready nodes..."
+kubectl patch deployment ingress-nginx-controller -n ingress-nginx -p '{"spec": {"template": {"spec": {"nodeSelector": {"ingress-ready": "true"}}}}}'
+
+echo "Waiting for Ingress Controller to be ready..."
+kubectl wait --namespace ingress-nginx \
+  --for=condition=ready pod \
+  --selector=app.kubernetes.io/component=controller \
+  --timeout=300s
+
 echo "Cluster ready. Registry at localhost:5000"

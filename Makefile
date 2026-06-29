@@ -10,7 +10,7 @@ LANG_RUNTIME   ?= metacall/core:latest
 LANGUAGES      ?= py rb node wasm java
 
 ## One-command dev setup: cluster + build + deploy + port-forward
-up: cluster-up deploy port-forward-api
+up: cluster-up deploy
 
 ## Create kind cluster + registry + Cilium CNI
 cluster-up:
@@ -109,13 +109,6 @@ clean:
 #  5. Dev helpers
 # ──────────────────────────────────────────────────────────────
 
-## Forward the API to localhost:9000
-port-forward-api:
-	kubectl -n metacall-system port-forward svc/function-mesh-api 9000:9000
-
-## Forward the Router to localhost:9090
-port-forward-router:
-	kubectl -n metacall-system port-forward svc/function-mesh-router 9090:9090
 
 ## Forward Hubble UI to localhost:12000
 hubble-ui:
@@ -148,6 +141,5 @@ test-api:
         docker-build docker-build-operator docker-build-api docker-build-router docker-build-runtime \
         docker-push docker-push-operator docker-push-api docker-push-router docker-push-runtime \
         deploy helm-install wait clean \
-        port-forward-api port-forward-router \
         hubble-ui hubble-observe \
         test test-controller test-router test-api

@@ -26,6 +26,9 @@ api:
   service:
     type: ClusterIP
     port: 9000
+  ingress:
+    enabled: true
+    host: api.metacall.localhost
   resources: {}
 
 router:
@@ -37,6 +40,9 @@ router:
   service:
     type: ClusterIP
     port: 9090
+  ingress:
+    enabled: true
+    host: router.metacall.localhost
   resources: {}
 
 cilium:
