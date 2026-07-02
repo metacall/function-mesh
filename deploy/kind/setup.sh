@@ -62,6 +62,6 @@ echo "Waiting for Ingress Controller to be ready..."
 kubectl wait --namespace ingress-nginx \
   --for=condition=ready pod \
   --selector=app.kubernetes.io/component=controller \
-  --timeout=300s
+  --timeout=600s
 
 echo "Cluster ready. Registry at localhost:5000"

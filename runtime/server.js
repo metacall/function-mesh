@@ -77,7 +77,7 @@ installDependencies();
 const functions = loadFunctions(FUNCTION_CONFIG);
 const funcNames = Object.keys(functions);
 
-function loadRemoteFunctions(configPath) {
+async function loadRemoteFunctionsWithRetry(configPath) {
 	if (!fs.existsSync(configPath)) {
 		console.log(`[runtime] No rpc_loader config at ${configPath} — cross-Pod calls disabled`);
 		return false;
@@ -85,17 +85,25 @@ function loadRemoteFunctions(configPath) {
 
 	console.log(`[runtime] Loading remote functions via native rpc_loader from: ${configPath}`);
 
-	try {
-		metacall_load_from_configuration(configPath);
-		console.log('[runtime] Native rpc_loader loaded successfully.');
-		return true;
-	} catch (err) {
-		console.error(`[runtime] Failed to load rpc_loader config: ${err.message}`);
-		return false;
+	for (let i = 0; i < 15; i++) {
+		try {
+			metacall_load_from_configuration(configPath);
+			console.log('[runtime] Native rpc_loader loaded successfully.');
+			return true;
+		} catch (err) {
+			console.error(`[runtime] Failed to load rpc_loader config (attempt ${i + 1}/15): ${err.message}`);
+			await new Promise(resolve => setTimeout(resolve, 2000));
+		}
 	}
+	
+	console.error('[runtime] Gave up loading rpc_loader config after 15 attempts.');
+	return false;
 }
 
-const isRpcActive = loadRemoteFunctions(RPC_CONFIG);
+let isRpcActive = false;
+loadRemoteFunctionsWithRetry(RPC_CONFIG).then(active => {
+	isRpcActive = active;
+});
 
 // Caching metacall_inspect()
 let inspectData = null;
