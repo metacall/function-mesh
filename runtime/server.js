@@ -1,6 +1,9 @@
 'use strict';
 
 const fs = require('fs');
+const http = require('http');
+const https = require('https');
+const path = require('path');
 const { execFileSync } = require('child_process');
 const express = require('express');
 const {
@@ -13,7 +16,11 @@ const {
 const PORT = parseInt(process.env.PORT, 10) || 8080;
 const FUNCTION_CONFIG = process.env.FUNCTION_CONFIG;
 const RPC_CONFIG = process.env.RPC_CONFIG || '/mesh/metacall-rpc.json';
+const FUNCTION_NAME = process.env.FUNCTION_NAME || '';
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS, 10) || 30000;
+const REMOTE_MAX_RETRIES = parseInt(process.env.MESH_REMOTE_MAX_RETRIES, 10) || 30;
+const REMOTE_RETRY_DELAY_MS = parseInt(process.env.MESH_REMOTE_RETRY_DELAY_MS, 10) || 2000;
+const REMOTE_HEALTH_TIMEOUT_MS = parseInt(process.env.MESH_REMOTE_HEALTH_TIMEOUT_MS, 10) || 2000;
 const APP_DIR = process.env.APP_DIR || '/app';
 
 if (!FUNCTION_CONFIG) {
@@ -77,34 +84,6 @@ installDependencies();
 const functions = loadFunctions(FUNCTION_CONFIG);
 const funcNames = Object.keys(functions);
 
-async function loadRemoteFunctionsWithRetry(configPath) {
-	if (!fs.existsSync(configPath)) {
-		console.log(`[runtime] No rpc_loader config at ${configPath} — cross-Pod calls disabled`);
-		return false;
-	}
-
-	console.log(`[runtime] Loading remote functions via native rpc_loader from: ${configPath}`);
-
-	for (let i = 0; i < 15; i++) {
-		try {
-			metacall_load_from_configuration(configPath);
-			console.log('[runtime] Native rpc_loader loaded successfully.');
-			return true;
-		} catch (err) {
-			console.error(`[runtime] Failed to load rpc_loader config (attempt ${i + 1}/15): ${err.message}`);
-			await new Promise(resolve => setTimeout(resolve, 2000));
-		}
-	}
-	
-	console.error('[runtime] Gave up loading rpc_loader config after 15 attempts.');
-	return false;
-}
-
-let isRpcActive = false;
-loadRemoteFunctionsWithRetry(RPC_CONFIG).then(active => {
-	isRpcActive = active;
-});
-
 // Caching metacall_inspect()
 let inspectData = null;
 try {
@@ -127,6 +106,223 @@ try {
 	inspectData = {};
 }
 
+let localReady = false;
+let remoteRetryTimer = null;
+let remotePassRunning = false;
+const remoteState = {
+	total: 0,
+	loaded: new Set(),
+	pending: new Set(),
+	failed: new Set(),
+	attempts: {},
+	live: false,
+};
+
+function publicRemoteState() {
+	return {
+		ready: localReady,
+		live: remoteState.live,
+		total: remoteState.total,
+		loaded: Array.from(remoteState.loaded).sort(),
+		pending: Array.from(remoteState.pending).sort(),
+		failed: Array.from(remoteState.failed).sort(),
+		attempts: { ...remoteState.attempts },
+	};
+}
+
+function readRemoteEndpoints(configPath) {
+	if (!fs.existsSync(configPath)) {
+		console.log(`[runtime] No rpc_loader config at ${configPath} — cross-Pod calls disabled`);
+		return [];
+	}
+
+	const rpcConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+	const scripts = Array.isArray(rpcConfig.scripts) ? rpcConfig.scripts : [];
+	const configDir = path.dirname(configPath);
+	const executionPath = rpcConfig.path
+		? (path.isAbsolute(rpcConfig.path) ? rpcConfig.path : path.resolve(configDir, rpcConfig.path))
+		: configDir;
+	const urls = new Set();
+
+	for (const script of scripts) {
+		const endpointsPath = path.resolve(executionPath, script);
+		const endpoints = JSON.parse(fs.readFileSync(endpointsPath, 'utf8'));
+		for (const url of endpoints.urls || []) {
+			if (typeof url === 'string' && url.length > 0) {
+				const normalized = url.endsWith('/') ? url : `${url}/`;
+				new URL(normalized);
+				urls.add(normalized);
+			}
+		}
+	}
+
+	return Array.from(urls).sort();
+}
+
+function getJSON(url) {
+	return new Promise(resolve => {
+		try {
+			const requestURL = new URL(url);
+			const transport = requestURL.protocol === 'https:' ? https : http;
+			const req = transport.get(requestURL, res => {
+				let body = '';
+				res.setEncoding('utf8');
+				res.on('data', chunk => {
+					body += chunk;
+				});
+				res.on('end', () => {
+					if (res.statusCode < 200 || res.statusCode >= 300) {
+						resolve(null);
+						return;
+					}
+					try {
+						resolve(JSON.parse(body));
+					} catch (_err) {
+						resolve(null);
+					}
+				});
+			});
+
+			req.setTimeout(REMOTE_HEALTH_TIMEOUT_MS, () => req.destroy());
+			req.on('error', () => resolve(null));
+		} catch (_err) {
+			resolve(null);
+		}
+	});
+}
+
+async function remoteReady(url) {
+	return (await getJSON(new URL('health/ready', url).toString())) !== null;
+}
+
+function endpointName(url) {
+	try {
+		return new URL(url).hostname.split('.')[0];
+	} catch (_err) {
+		return '';
+	}
+}
+
+async function earlierRuntimesSettled() {
+	if (!FUNCTION_NAME) {
+		return true;
+	}
+
+	const earlier = Array.from(remoteState.pending)
+		.filter(url => endpointName(url).localeCompare(FUNCTION_NAME) < 0);
+	for (const url of earlier) {
+		const status = await getJSON(new URL('status', url).toString());
+		if (!status || !Array.isArray(status.pending) || status.pending.length > 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function loadOneRemote(url) {
+	const token = Buffer.from(url).toString('hex');
+	const endpointsName = `rpc-endpoints-${token}.json`;
+	const configPath = path.join('/tmp', `rpc-config-${token}.json`);
+
+	fs.writeFileSync(path.join('/tmp', endpointsName), JSON.stringify({ urls: [url] }));
+	fs.writeFileSync(configPath, JSON.stringify({
+		language_id: 'rpc',
+		path: '/tmp',
+		scripts: [endpointsName],
+	}));
+
+	metacall_load_from_configuration(configPath);
+}
+
+function recordRemoteFailure(url, reason) {
+	const attempts = (remoteState.attempts[url] || 0) + 1;
+	remoteState.attempts[url] = attempts;
+	console.warn(`[runtime] Remote discovery ${attempts}/${REMOTE_MAX_RETRIES} failed for ${url}: ${reason}`);
+
+	if (attempts >= REMOTE_MAX_RETRIES) {
+		remoteState.pending.delete(url);
+		remoteState.failed.add(url);
+		console.error(`[runtime] Remote discovery exhausted retries for ${url}`);
+	}
+}
+
+async function loadRemotePass() {
+	if (remotePassRunning) {
+		return;
+	}
+	remotePassRunning = true;
+
+	try {
+		// rpc_loader discovery is synchronous. Let runtimes take deterministic
+		// turns so a circular pair never blocks both event loops at once.
+		if (await earlierRuntimesSettled()) {
+			for (const url of Array.from(remoteState.pending)) {
+				if (!await remoteReady(url)) {
+					recordRemoteFailure(url, 'pod is not ready');
+					continue;
+				}
+
+				try {
+					console.log(`[runtime] Discovering remote functions from ${url}`);
+					loadOneRemote(url);
+					remoteState.pending.delete(url);
+					remoteState.loaded.add(url);
+					console.log(`[runtime] Remote functions loaded from ${url}`);
+				} catch (err) {
+					recordRemoteFailure(url, err.message);
+				}
+			}
+		}
+	} finally {
+		remotePassRunning = false;
+	}
+
+	if (remoteState.pending.size === 0) {
+		remoteState.live = remoteState.failed.size === 0;
+		console.log(remoteState.live
+			? `[runtime] Remote discovery complete (${remoteState.loaded.size}/${remoteState.total})`
+			: `[runtime] Remote discovery degraded (${remoteState.loaded.size}/${remoteState.total} loaded, ${remoteState.failed.size} failed)`);
+		return;
+	}
+
+	remoteRetryTimer = setTimeout(loadRemotePass, REMOTE_RETRY_DELAY_MS);
+}
+
+function startRemoteLoading(configPath) {
+	let endpoints;
+	try {
+		endpoints = readRemoteEndpoints(configPath);
+	} catch (err) {
+		console.error(`[runtime] Failed to read RPC endpoints: ${err.message}`);
+		remoteState.failed.add(configPath);
+		return;
+	}
+
+	remoteState.total = endpoints.length;
+	if (endpoints.length > 0 && !FUNCTION_NAME) {
+		console.error('[runtime] FUNCTION_NAME is required when remote endpoints are configured.');
+		for (const url of endpoints) {
+			remoteState.failed.add(url);
+			remoteState.attempts[url] = REMOTE_MAX_RETRIES;
+		}
+		return;
+	}
+
+	for (const url of endpoints) {
+		remoteState.pending.add(url);
+		remoteState.attempts[url] = 0;
+	}
+
+	if (endpoints.length === 0) {
+		remoteState.live = true;
+		console.log('[runtime] No remote endpoints configured; runtime is live.');
+		return;
+	}
+
+	console.log(`[runtime] Starting background discovery for ${endpoints.length} remote endpoint(s).`);
+	setImmediate(loadRemotePass);
+}
+
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -135,12 +331,21 @@ app.use((req, _res, next) => {
 	next();
 });
 
-app.get('/health', (_req, res) => {
-	res.json({
-		status: 'ok',
+function readinessResponse(_req, res) {
+	res.status(localReady ? 200 : 503).json({
+		status: localReady ? 'ready' : 'initializing',
 		functions: funcNames.length,
 		uptime: Math.floor(process.uptime()),
 	});
+}
+
+app.get('/health', readinessResponse);
+app.get('/health/ready', readinessResponse);
+app.get('/health/live', (_req, res) => {
+	res.json({ status: 'alive', uptime: Math.floor(process.uptime()) });
+});
+app.get('/status', (_req, res) => {
+	res.json(publicRemoteState());
 });
 
 app.get('/inspect', (_req, res) => {
@@ -247,24 +452,32 @@ app.use((err, _req, res, _next) => {
 let server;
 
 server = app.listen(PORT, () => {
+	localReady = true;
 	console.log(`[runtime] ──────────────────────────────────────────`);
 	console.log(`[runtime] Pod runtime started on port ${PORT}`);
 	console.log(`[runtime] Local functions: ${funcNames.join(', ') || '(none)'}`);
 	console.log(`[runtime] Function config: ${FUNCTION_CONFIG}`);
 	console.log(`[runtime] RPC config: ${RPC_CONFIG}`);
-	console.log(`[runtime] Native rpc_loader: ${isRpcActive ? 'ACTIVE (cross-Pod calls enabled)' : 'INACTIVE'}`);
+	console.log(`[runtime] Native rpc_loader: background discovery`);
 	console.log(`[runtime] Timeout: ${REQUEST_TIMEOUT_MS}ms`);
 	console.log(`[runtime] ──────────────────────────────────────────`);
 	console.log(`[runtime] Endpoints:`);
 	console.log(`[runtime]   GET  /health            → K8s probes`);
+	console.log(`[runtime]   GET  /health/ready      → readiness/startup probes`);
+	console.log(`[runtime]   GET  /health/live       → liveness probe`);
+	console.log(`[runtime]   GET  /status            → remote discovery state`);
 	console.log(`[runtime]   GET  /inspect           → Mesh discovery`);
 	console.log(`[runtime]   POST /call/:func        → sync invocation`);
 	console.log(`[runtime]   POST /await/:func       → async invocation`);
 	console.log(`[runtime] ──────────────────────────────────────────`);
+	startRemoteLoading(RPC_CONFIG);
 });
 
 function shutdown(signal) {
 	console.log(`[runtime] Received ${signal}. Shutting down gracefully...`);
+	if (remoteRetryTimer) {
+		clearTimeout(remoteRetryTimer);
+	}
 	if (server) {
 		server.close(() => {
 			console.log(`[runtime] Server closed. Exiting.`);

@@ -614,9 +614,9 @@ func inspectDeployments(functions []meshv1.Function) []map[string]any {
 			item = &group{status: "ready", ports: []int{8080}, packages: map[string][]map[string]any{}}
 			groups[suffix] = item
 		}
-		if fn.Status.Phase == "Failed" {
+		if fn.Status.Phase == "Failed" || fn.Status.Phase == "Degraded" {
 			item.status = "failed"
-		} else if fn.Status.Phase != "Running" && item.status != "failed" {
+		} else if fn.Status.Phase != "Live" && item.status != "failed" {
 			item.status = "create"
 		}
 		funcs := make([]map[string]any, 0, len(fn.Status.Functions))

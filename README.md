@@ -81,6 +81,22 @@ kubectl get all -n metacall-functions
 
 # Inspect functions API
 curl http://api.metacall.localhost/api/inspect
+
+# inspect configMaps
+kubectl get configmap <configmap-name> -n <namespace> -o yaml
+
+# inspect pod working directory Commands
+# 1- Print the current working directory (pwd):
+kubectl exec -n metacall-functions -it <pod-name> -- pwd
+
+# 2- List all files in the current directory:
+kubectl exec -n metacall-functions -it <pod-name> -- ls
+
+# 3- List all files including hidden files:
+kubectl exec -n metacall-functions -it <pod-name> -- ls -la
+
+# 4- Open an interactive shell inside the pod to explore:
+kubectl exec -it <pod-name> -n metacall-functions -- sh
 ```
 
 ## Observability & Performance

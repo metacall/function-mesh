@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -30,7 +31,10 @@ func TestGenerateEndpointsUsesDeployGroupAndSkipsSelf(t *testing.T) {
 	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(auth, processor, analytics, utility).Build()
 	reconciler := &FunctionReconciler{Client: client, Scheme: scheme}
 
-	got := reconciler.generateEndpoints(ctx, auth)
+	got, err := reconciler.generateEndpoints(ctx, auth)
+	if err != nil {
+		t.Fatalf("generate endpoints failed: %v", err)
+	}
 
 	want := []string{"http://processor-node.metacall-functions.svc.cluster.local:8080/"}
 	if len(got) != len(want) || got[0] != want[0] {
@@ -47,7 +51,10 @@ func TestGenerateEndpointsUngroupedFunctionSeesAllPeers(t *testing.T) {
 	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(auth, processor, utility).Build()
 	reconciler := &FunctionReconciler{Client: client, Scheme: scheme}
 
-	got := reconciler.generateEndpoints(ctx, utility)
+	got, err := reconciler.generateEndpoints(ctx, utility)
+	if err != nil {
+		t.Fatalf("generate endpoints failed: %v", err)
+	}
 
 	if len(got) != 2 {
 		t.Fatalf("expected two peer endpoints, got %v", got)
@@ -94,11 +101,20 @@ func TestReconcileCreatesRuntimeResources(t *testing.T) {
 	if envValue(container.Env, "FUNCTION_CONFIG") != "/app/metacall-py.json" {
 		t.Fatalf("unexpected FUNCTION_CONFIG: %s", envValue(container.Env, "FUNCTION_CONFIG"))
 	}
+	if envValue(container.Env, "FUNCTION_NAME") != "auth-py" {
+		t.Fatalf("unexpected FUNCTION_NAME: %s", envValue(container.Env, "FUNCTION_NAME"))
+	}
 	if envValue(container.Env, "RPC_CONFIG") != "/mesh/metacall-rpc.json" {
 		t.Fatalf("unexpected RPC_CONFIG: %s", envValue(container.Env, "RPC_CONFIG"))
 	}
 	if envValue(container.Env, "PORT") != "8080" {
 		t.Fatalf("unexpected PORT: %s", envValue(container.Env, "PORT"))
+	}
+	if envValue(container.Env, "METACALL_RPC_RETRY_COUNT") != "1" {
+		t.Fatalf("unexpected METACALL_RPC_RETRY_COUNT: %s", envValue(container.Env, "METACALL_RPC_RETRY_COUNT"))
+	}
+	if envValue(container.Env, "MESH_REMOTE_MAX_RETRIES") != "30" {
+		t.Fatalf("unexpected MESH_REMOTE_MAX_RETRIES: %s", envValue(container.Env, "MESH_REMOTE_MAX_RETRIES"))
 	}
 	if len(container.VolumeMounts) != 2 {
 		t.Fatalf("expected source and mesh mounts, got %d", len(container.VolumeMounts))
@@ -110,8 +126,12 @@ func TestReconcileCreatesRuntimeResources(t *testing.T) {
 	assertConfigMapVolume(t, deployment.Spec.Template.Spec.Volumes, "source-code", "auth-py-code")
 	assertEmptyDirVolume(t, deployment.Spec.Template.Spec.Volumes, "app-workdir")
 	assertConfigMapVolume(t, deployment.Spec.Template.Spec.Volumes, "mesh-endpoints", "auth-py-endpoints")
-	assertHTTPProbe(t, container.ReadinessProbe, "/health", "http")
-	assertHTTPProbe(t, container.LivenessProbe, "/health", "http")
+	assertHTTPProbe(t, container.StartupProbe, "/health/ready", "http")
+	assertHTTPProbe(t, container.ReadinessProbe, "/health/ready", "http")
+	assertHTTPProbe(t, container.LivenessProbe, "/health/live", "http")
+	if container.StartupProbe.FailureThreshold != 60 {
+		t.Fatalf("unexpected startup failure threshold: %d", container.StartupProbe.FailureThreshold)
+	}
 
 	var service corev1.Service
 	if err := client.Get(ctx, types.NamespacedName{Name: "auth-py", Namespace: "metacall-functions"}, &service); err != nil {
@@ -128,11 +148,11 @@ func TestReconcileCreatesRuntimeResources(t *testing.T) {
 	if _, ok := cm.Data["metacall-rpc.json"]; !ok {
 		t.Fatalf("missing metacall-rpc.json")
 	}
-	if cm.Data["metacall-rpc.json"] != `{"language_id":"rpc","path":"/mesh","scripts":["endpoints.txt"]}` {
+	if cm.Data["metacall-rpc.json"] != `{"language_id":"rpc","path":"/mesh","scripts":["endpoints.json"]}` {
 		t.Fatalf("unexpected rpc config: %s", cm.Data["metacall-rpc.json"])
 	}
-	if strings.TrimSpace(cm.Data["endpoints.txt"]) != "" {
-		t.Fatalf("single function should have no peer endpoints, got %q", cm.Data["endpoints.txt"])
+	if cm.Data["endpoints.json"] != `{"urls":[]}` {
+		t.Fatalf("single function should have no peer endpoints, got %q", cm.Data["endpoints.json"])
 	}
 }
 
@@ -197,14 +217,14 @@ func TestUpdateStatusReadsRuntimeInspect(t *testing.T) {
 		Scheme: scheme,
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			if req.Method != http.MethodGet {
-				t.Fatalf("unexpected inspect method: %s", req.Method)
+				t.Fatalf("unexpected runtime method: %s", req.Method)
 			}
-			if req.URL.String() != "http://auth-py.metacall-functions.svc.cluster.local:8080/inspect" {
-				t.Fatalf("unexpected inspect URL: %s", req.URL.String())
-			}
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body: io.NopCloser(strings.NewReader(`{
+			var body string
+			switch req.URL.Path {
+			case "/status":
+				body = `{"ready":true,"live":true,"total":0,"loaded":[],"pending":[],"failed":[]}`
+			case "/inspect":
+				body = `{
 					"py": [{
 						"scope": {
 							"funcs": [
@@ -213,8 +233,15 @@ func TestUpdateStatusReadsRuntimeInspect(t *testing.T) {
 							]
 						}
 					}]
-				}`)),
-				Header: make(http.Header),
+				}`
+			default:
+				t.Fatalf("unexpected runtime URL: %s", req.URL.String())
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     make(http.Header),
 			}, nil
 		})},
 	}
@@ -229,8 +256,11 @@ func TestUpdateStatusReadsRuntimeInspect(t *testing.T) {
 	if err := client.Get(ctx, types.NamespacedName{Name: "auth-py", Namespace: "metacall-functions"}, &got); err != nil {
 		t.Fatalf("get function: %v", err)
 	}
-	if got.Status.Phase != "Running" {
+	if got.Status.Phase != "Live" {
 		t.Fatalf("unexpected phase: %s", got.Status.Phase)
+	}
+	if got.Status.Remote != "0/0" {
+		t.Fatalf("unexpected remote status: %s", got.Status.Remote)
 	}
 	if got.Status.PodCount != 1 {
 		t.Fatalf("unexpected pod count: %d", got.Status.PodCount)
@@ -240,6 +270,84 @@ func TestUpdateStatusReadsRuntimeInspect(t *testing.T) {
 	}
 	if len(got.Status.Functions) != 2 || got.Status.Functions[0] != "signin" || got.Status.Functions[1] != "signup" {
 		t.Fatalf("unexpected functions: %v", got.Status.Functions)
+	}
+}
+
+func TestUpdateStatusTracksRemoteDiscovery(t *testing.T) {
+	tests := []struct {
+		name        string
+		statusBody  string
+		wantPhase   string
+		wantRemote  string
+		wantFailed  int
+		wantRequeue bool
+	}{
+		{
+			name:        "initializing",
+			statusBody:  `{"live":false,"total":2,"loaded":["http://peer-a/"],"pending":["http://peer-b/"],"failed":[]}`,
+			wantPhase:   "Initializing",
+			wantRemote:  "1/2",
+			wantRequeue: true,
+		},
+		{
+			name:       "degraded",
+			statusBody: `{"live":false,"total":2,"loaded":["http://peer-a/"],"pending":[],"failed":["http://peer-b/"]}`,
+			wantPhase:  "Degraded",
+			wantRemote: "1/2",
+			wantFailed: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			scheme := testScheme(t)
+			fn := testFunction("worker-py", "py", "app")
+			deployment := &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Name: fn.Name, Namespace: fn.Namespace},
+				Status:     appsv1.DeploymentStatus{ReadyReplicas: 1},
+			}
+			client := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithStatusSubresource(&meshv1.Function{}).
+				WithObjects(fn, deployment).
+				Build()
+			reconciler := &FunctionReconciler{
+				Client: client,
+				Scheme: scheme,
+				HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					body := tt.statusBody
+					if req.URL.Path == "/inspect" {
+						body = `{}`
+					}
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Status:     "200 OK",
+						Body:       io.NopCloser(strings.NewReader(body)),
+						Header:     make(http.Header),
+					}, nil
+				})},
+			}
+
+			needsRequeue, err := reconciler.updateStatus(ctx, fn)
+			if err != nil {
+				t.Fatalf("update status failed: %v", err)
+			}
+			if needsRequeue != tt.wantRequeue {
+				t.Fatalf("unexpected requeue: got %v want %v", needsRequeue, tt.wantRequeue)
+			}
+
+			var got meshv1.Function
+			if err := client.Get(ctx, types.NamespacedName{Name: fn.Name, Namespace: fn.Namespace}, &got); err != nil {
+				t.Fatalf("get function: %v", err)
+			}
+			if got.Status.Phase != tt.wantPhase || got.Status.Remote != tt.wantRemote {
+				t.Fatalf("unexpected status: %#v", got.Status)
+			}
+			if len(got.Status.RemoteFailed) != tt.wantFailed {
+				t.Fatalf("unexpected remote failures: %v", got.Status.RemoteFailed)
+			}
+		})
 	}
 }
 
@@ -354,10 +462,21 @@ func assertEndpointConfigMap(t *testing.T, ctx context.Context, client crclient.
 	if err := client.Get(ctx, types.NamespacedName{Name: name, Namespace: "metacall-functions"}, &cm); err != nil {
 		t.Fatalf("get endpoint configmap %s: %v", name, err)
 	}
-	if strings.TrimSpace(cm.Data["endpoints.txt"]) != endpoints {
-		t.Fatalf("unexpected endpoints in %s: got %q want %q", name, cm.Data["endpoints.txt"], endpoints)
+
+	urls := []string{}
+	if endpoints != "" {
+		urls = strings.Split(endpoints, "\n")
 	}
-	if cm.Data["metacall-rpc.json"] != `{"language_id":"rpc","path":"/mesh","scripts":["endpoints.txt"]}` {
+	data := map[string]interface{}{
+		"urls": urls,
+	}
+	b, _ := json.Marshal(data)
+	expectedJSON := string(b)
+
+	if cm.Data["endpoints.json"] != expectedJSON {
+		t.Fatalf("unexpected endpoints in %s: got %q want %q", name, cm.Data["endpoints.json"], expectedJSON)
+	}
+	if cm.Data["metacall-rpc.json"] != `{"language_id":"rpc","path":"/mesh","scripts":["endpoints.json"]}` {
 		t.Fatalf("unexpected rpc config in %s: %s", name, cm.Data["metacall-rpc.json"])
 	}
 }

@@ -25,15 +25,21 @@ type RuntimeSpec struct {
 }
 
 type FunctionStatus struct {
-	Phase      string   `json:"phase,omitempty"`
-	ServiceURL string   `json:"serviceURL,omitempty"`
-	Functions  []string `json:"functions,omitempty"`
-	PodCount   int32    `json:"podCount,omitempty"`
+	Phase        string   `json:"phase,omitempty"`
+	ServiceURL   string   `json:"serviceURL,omitempty"`
+	Functions    []string `json:"functions,omitempty"`
+	PodCount     int32    `json:"podCount,omitempty"`
+	Remote       string   `json:"remote,omitempty"`
+	RemoteFailed []string `json:"remoteFailed,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=fn
+// +kubebuilder:printcolumn:name="Language",type=string,JSONPath=`.spec.language`
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Pods",type=integer,JSONPath=`.status.podCount`
+// +kubebuilder:printcolumn:name="Remote",type=string,JSONPath=`.status.remote`
 type Function struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

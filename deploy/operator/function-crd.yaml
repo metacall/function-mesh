@@ -78,6 +78,12 @@ spec:
                 podCount:
                   type: integer
                   format: int32
+                remote:
+                  type: string
+                remoteFailed:
+                  type: array
+                  items:
+                    type: string
       additionalPrinterColumns:
         - name: Language
           type: string
@@ -85,6 +91,9 @@ spec:
         - name: Phase
           type: string
           jsonPath: .status.phase
-        - name: ServiceURL
+        - name: Pods
+          type: integer
+          jsonPath: .status.podCount
+        - name: Remote
           type: string
-          jsonPath: .status.serviceURL
+          jsonPath: .status.remote

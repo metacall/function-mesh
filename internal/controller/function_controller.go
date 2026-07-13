@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"reflect"
 	"sort"
-	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -114,8 +113,12 @@ func (r *FunctionReconciler) reconcileDeployment(ctx context.Context, fn *meshv1
 		deployment.Spec.Selector = &metav1.LabelSelector{MatchLabels: selectorLabels(fn)}
 		deployment.Spec.Template.Labels = mergeLabels(deployment.Spec.Template.Labels, functionLabels(fn))
 
+		endpoints, err := r.generateEndpoints(ctx, fn)
+		if err != nil {
+			return err
+		}
 		annotations := map[string]string{
-			AnnotationEndpointsHash: hashEndpoints(r.generateEndpoints(ctx, fn)),
+			AnnotationEndpointsHash: hashEndpoints(endpoints),
 		}
 		if r.L7Visibility {
 			annotations["policy.cilium.io/proxy-visibility"] = "<Ingress/8080/TCP/HTTP>,<Egress/8080/TCP/HTTP>"
@@ -143,17 +146,25 @@ func (r *FunctionReconciler) reconcileDeployment(ctx context.Context, fn *meshv1
 				Protocol:      corev1.ProtocolTCP,
 			}},
 			Env: []corev1.EnvVar{
+				{Name: "FUNCTION_NAME", Value: fn.Name},
 				{Name: "FUNCTION_CONFIG", Value: "/app/" + entrypoint(fn)},
 				{Name: "RPC_CONFIG", Value: "/mesh/metacall-rpc.json"},
 				{Name: "PORT", Value: fmt.Sprintf("%d", defaultPort)},
+				{Name: "METACALL_RPC_TIMEOUT_MS", Value: "5000"},
+				{Name: "METACALL_RPC_RETRY_COUNT", Value: "1"},
+				{Name: "METACALL_RPC_RETRY_DELAY_MS", Value: "0"},
+				{Name: "MESH_REMOTE_MAX_RETRIES", Value: "30"},
+				{Name: "MESH_REMOTE_RETRY_DELAY_MS", Value: "2000"},
+				{Name: "MESH_REMOTE_HEALTH_TIMEOUT_MS", Value: "2000"},
 			},
 			Resources: fn.Spec.Runtime.Resources,
 			VolumeMounts: []corev1.VolumeMount{
 				{Name: "app-workdir", MountPath: "/app"},
 				{Name: "mesh-endpoints", MountPath: "/mesh", ReadOnly: true},
 			},
-			ReadinessProbe: healthProbe(),
-			LivenessProbe:  healthProbe(),
+			StartupProbe:   startupProbe(),
+			ReadinessProbe: httpProbe("/health/ready"),
+			LivenessProbe:  httpProbe("/health/live"),
 		}}
 		deployment.Spec.Template.Spec.Volumes = []corev1.Volume{
 			{
@@ -163,7 +174,7 @@ func (r *FunctionReconciler) reconcileDeployment(ctx context.Context, fn *meshv1
 				}},
 			},
 			{
-				Name: "app-workdir",
+				Name:         "app-workdir",
 				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 			},
 			{
@@ -239,8 +250,20 @@ func (r *FunctionReconciler) upsertEndpointConfigMap(ctx context.Context, owner 
 
 	mutate := func() error {
 		cm.Labels = mergeLabels(cm.Labels, functionLabels(target))
+		endpoints, err := r.generateEndpoints(ctx, target)
+		if err != nil {
+			return err
+		}
+		if endpoints == nil {
+			endpoints = []string{}
+		}
+		data := map[string]interface{}{
+			"urls": endpoints,
+		}
+		b, _ := json.Marshal(data)
+
 		cm.Data = map[string]string{
-			"endpoints.txt":     strings.Join(r.generateEndpoints(ctx, target), "\n"),
+			"endpoints.json":    string(b),
 			"metacall-rpc.json": rpcConfigJSON(),
 		}
 		return controllerutil.SetControllerReference(owner, &cm, r.Scheme)
@@ -250,10 +273,10 @@ func (r *FunctionReconciler) upsertEndpointConfigMap(ctx context.Context, owner 
 	return err
 }
 
-func (r *FunctionReconciler) generateEndpoints(ctx context.Context, fn *meshv1.Function) []string {
+func (r *FunctionReconciler) generateEndpoints(ctx context.Context, fn *meshv1.Function) ([]string, error) {
 	var list meshv1.FunctionList
 	if err := r.List(ctx, &list, client.InNamespace(fn.Namespace)); err != nil {
-		return nil
+		return nil, err
 	}
 
 	urls := make([]string, 0, len(list.Items))
@@ -267,7 +290,7 @@ func (r *FunctionReconciler) generateEndpoints(ctx context.Context, fn *meshv1.F
 		urls = append(urls, serviceURL(&other))
 	}
 	sort.Strings(urls)
-	return urls
+	return urls, nil
 }
 
 func (r *FunctionReconciler) updateStatus(ctx context.Context, fn *meshv1.Function) (bool, error) {
@@ -280,19 +303,46 @@ func (r *FunctionReconciler) updateStatus(ctx context.Context, fn *meshv1.Functi
 	next.Status.ServiceURL = serviceURL(fn)
 	next.Status.PodCount = deployment.Status.ReadyReplicas
 	needsRequeue := deployment.Status.ReadyReplicas == 0
-	if deployment.Status.ReadyReplicas > 0 {
-		next.Status.Phase = "Running"
-	} else if deployment.Status.UnavailableReplicas > 0 {
-		next.Status.Phase = "Failed"
+	if deployment.Status.ReadyReplicas == 0 {
+		if fn.Spec.Runtime.Replicas != nil && *fn.Spec.Runtime.Replicas == 0 {
+			next.Status.Phase = "ScaledDown"
+			needsRequeue = false
+		} else {
+			next.Status.Phase = "Pending"
+		}
+		next.Status.Functions = nil
+		next.Status.Remote = ""
+		next.Status.RemoteFailed = nil
 	} else {
-		next.Status.Phase = "Pending"
+		remote, err := r.fetchRemoteStatus(ctx, fn)
+		if err != nil {
+			next.Status.Phase = "Initializing"
+			next.Status.Remote = ""
+			next.Status.RemoteFailed = nil
+			needsRequeue = true
+		} else {
+			next.Status.Remote = fmt.Sprintf("%d/%d", len(remote.Loaded), remote.Total)
+			next.Status.RemoteFailed = append([]string(nil), remote.Failed...)
+			switch {
+			case len(remote.Failed) > 0:
+				next.Status.Phase = "Degraded"
+			case remote.Live:
+				next.Status.Phase = "Live"
+			default:
+				next.Status.Phase = "Initializing"
+				needsRequeue = true
+			}
+		}
 	}
 
-	functions, err := r.inspectFunctions(ctx, fn)
-	if err == nil {
-		next.Status.Functions = functions
-	} else if deployment.Status.ReadyReplicas > 0 {
-		needsRequeue = true
+	if deployment.Status.ReadyReplicas > 0 {
+		functions, err := r.inspectFunctions(ctx, fn)
+		if err == nil {
+			next.Status.Functions = functions
+		} else {
+			next.Status.Functions = nil
+			needsRequeue = true
+		}
 	}
 
 	if reflect.DeepEqual(fn.Status, next.Status) {
@@ -303,6 +353,40 @@ func (r *FunctionReconciler) updateStatus(ctx context.Context, fn *meshv1.Functi
 	} else {
 		return needsRequeue, err
 	}
+}
+
+type runtimeRemoteStatus struct {
+	Live    bool     `json:"live"`
+	Total   int      `json:"total"`
+	Loaded  []string `json:"loaded"`
+	Pending []string `json:"pending"`
+	Failed  []string `json:"failed"`
+}
+
+func (r *FunctionReconciler) fetchRemoteStatus(ctx context.Context, fn *meshv1.Function) (runtimeRemoteStatus, error) {
+	httpClient := r.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 2 * time.Second}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serviceURL(fn)+"status", nil)
+	if err != nil {
+		return runtimeRemoteStatus{}, err
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return runtimeRemoteStatus{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return runtimeRemoteStatus{}, fmt.Errorf("status returned %s", resp.Status)
+	}
+
+	var status runtimeRemoteStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return runtimeRemoteStatus{}, err
+	}
+	return status, nil
 }
 
 func (r *FunctionReconciler) inspectFunctions(ctx context.Context, fn *meshv1.Function) ([]string, error) {
@@ -419,21 +503,35 @@ func sameDeployGroup(a, b *meshv1.Function) bool {
 }
 
 func rpcConfigJSON() string {
-	return `{"language_id":"rpc","path":"/mesh","scripts":["endpoints.txt"]}`
+	return `{"language_id":"rpc","path":"/mesh","scripts":["endpoints.json"]}`
 }
 
 func hashEndpoints(endpoints []string) string {
-	sum := sha256.Sum256([]byte(strings.Join(endpoints, "\n")))
+	if endpoints == nil {
+		endpoints = []string{}
+	}
+	data := map[string]interface{}{
+		"urls": endpoints,
+	}
+	b, _ := json.Marshal(data)
+	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
 
-func healthProbe() *corev1.Probe {
+func httpProbe(path string) *corev1.Probe {
 	return &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
-				Path: "/health",
+				Path: path,
 				Port: intstr.FromString("http"),
 			},
 		},
 	}
+}
+
+func startupProbe() *corev1.Probe {
+	probe := httpProbe("/health/ready")
+	probe.PeriodSeconds = 5
+	probe.FailureThreshold = 60
+	return probe
 }

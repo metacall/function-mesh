@@ -37,6 +37,9 @@ func (in *FunctionStatus) DeepCopyInto(out *FunctionStatus) {
 	if in.Functions != nil {
 		out.Functions = append([]string(nil), in.Functions...)
 	}
+	if in.RemoteFailed != nil {
+		out.RemoteFailed = append([]string(nil), in.RemoteFailed...)
+	}
 }
 
 func (in *FunctionStatus) DeepCopy() *FunctionStatus {
