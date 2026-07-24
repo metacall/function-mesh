@@ -12,9 +12,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -30,19 +33,50 @@ type Server struct {
 	RouterURL  string
 	WorkDir    string
 	HTTPClient *http.Client
+
+	requests        *prometheus.CounterVec
+	requestDuration *prometheus.HistogramVec
+	deploys         *prometheus.CounterVec
+	activeFunctions prometheus.Gauge
+	registry        *prometheus.Registry
 }
 
 func NewServer(kube client.Client, clientset kubernetes.Interface, namespace, routerURL, workDir string) *Server {
 	if workDir == "" {
 		workDir = os.TempDir()
 	}
+	registry := prometheus.NewRegistry()
+	requests := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "metacall_api_request_total",
+		Help: "Total HTTP requests handled by the Function Mesh API.",
+	}, []string{"method", "path", "status"})
+	requestDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "metacall_api_request_duration_seconds",
+		Help:    "Duration of Function Mesh API HTTP requests.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"method", "path"})
+	deploys := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "metacall_api_deploy_total",
+		Help: "Total Function deployment operations.",
+	}, []string{"operation", "status"})
+	activeFunctions := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "metacall_api_active_functions",
+		Help: "Current number of Function resources managed by the API.",
+	})
+	registry.MustRegister(requests, requestDuration, deploys, activeFunctions)
+
 	return &Server{
-		Client:     kube,
-		Clientset:  clientset,
-		Namespace:  namespace,
-		RouterURL:  strings.TrimRight(routerURL, "/"),
-		WorkDir:    workDir,
-		HTTPClient: &http.Client{Timeout: 60 * time.Second},
+		Client:          kube,
+		Clientset:       clientset,
+		Namespace:       namespace,
+		RouterURL:       strings.TrimRight(routerURL, "/"),
+		WorkDir:         workDir,
+		HTTPClient:      &http.Client{Timeout: 60 * time.Second},
+		requests:        requests,
+		requestDuration: requestDuration,
+		deploys:         deploys,
+		activeFunctions: activeFunctions,
+		registry:        registry,
 	}
 }
 
@@ -61,7 +95,87 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/inspect", s.handleInspect)
 	mux.HandleFunc("/api/billing/", s.handleBillingStub)
 	mux.HandleFunc("/", s.handleFallback)
-	return mux
+	mux.Handle("/metrics", promhttp.HandlerFor(s.registry, promhttp.HandlerOpts{}))
+	return s.metricsMiddleware(mux)
+}
+
+type statusResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (w *statusResponseWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusResponseWriter) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func (s *Server) metricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" {
+			s.updateActiveFunctions(r.Context())
+			next.ServeHTTP(w, r)
+			return
+		}
+		started := time.Now()
+		recorder := &statusResponseWriter{ResponseWriter: w}
+		next.ServeHTTP(recorder, r)
+		status := recorder.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		path := metricPath(r)
+		statusLabel := strconv.Itoa(status)
+		s.requests.WithLabelValues(r.Method, path, statusLabel).Inc()
+		s.requestDuration.WithLabelValues(r.Method, path).Observe(time.Since(started).Seconds())
+		if operation := deployOperation(path); operation != "" {
+			s.deploys.WithLabelValues(operation, statusLabel).Inc()
+		}
+	})
+}
+
+func (s *Server) updateActiveFunctions(ctx context.Context) {
+	if s.Client == nil {
+		return
+	}
+	var functions meshv1.FunctionList
+	if err := s.Client.List(ctx, &functions, client.InNamespace(s.Namespace)); err == nil {
+		s.activeFunctions.Set(float64(len(functions.Items)))
+	}
+}
+
+func metricPath(r *http.Request) string {
+	if strings.Contains(r.URL.Path, "/call/") {
+		return "/call/{function}"
+	}
+	if r.Pattern == "/" || r.Pattern == "" {
+		return "/unmatched"
+	}
+	return r.Pattern
+}
+
+func deployOperation(path string) string {
+	switch path {
+	case "/api/deploy/create", "/api/repository/add", "/api/package/create":
+		return "create"
+	case "/api/deploy/delete":
+		return "delete"
+	default:
+		return ""
+	}
 }
 
 func (s *Server) handleReadiness(w http.ResponseWriter, _ *http.Request) {

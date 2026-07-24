@@ -6,12 +6,33 @@ const https = require('https');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const express = require('express');
+const client = require('prom-client');
 const {
 	metacall_load_from_configuration,
 	metacall_load_from_configuration_export,
 	metacall_inspect,
 	metacall_await,
 } = require('metacall');
+const opentelemetry = require('@opentelemetry/api');
+const { NodeSDK } = require('@opentelemetry/sdk-node');
+const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-http');
+const { HttpInstrumentation } = require('@opentelemetry/instrumentation-http');
+const { DnsInstrumentation } = require('@opentelemetry/instrumentation-dns');
+
+if (process.env.OTEL_EXPORTER_OTLP_ENDPOINT) {
+	const sdk = new NodeSDK({
+		serviceName: 'function-mesh-runtime',
+		traceExporter: new OTLPTraceExporter({
+			url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT + '/v1/traces',
+		}),
+		instrumentations: [
+			new HttpInstrumentation(),
+			new DnsInstrumentation(),
+		],
+	});
+	sdk.start();
+}
+const tracer = opentelemetry.trace.getTracer('runtime');
 
 const PORT = parseInt(process.env.PORT, 10) || 8080;
 const FUNCTION_CONFIG = process.env.FUNCTION_CONFIG;
@@ -22,6 +43,36 @@ const REMOTE_MAX_RETRIES = parseInt(process.env.MESH_REMOTE_MAX_RETRIES, 10) || 
 const REMOTE_RETRY_DELAY_MS = parseInt(process.env.MESH_REMOTE_RETRY_DELAY_MS, 10) || 2000;
 const REMOTE_HEALTH_TIMEOUT_MS = parseInt(process.env.MESH_REMOTE_HEALTH_TIMEOUT_MS, 10) || 2000;
 const APP_DIR = process.env.APP_DIR || '/app';
+
+client.collectDefaultMetrics({ prefix: '' });
+const runtimeCalls = new client.Counter({
+	name: 'metacall_runtime_call_total',
+	help: 'Total function invocations handled by this runtime.',
+	labelNames: ['function', 'status'],
+});
+const runtimeCallDuration = new client.Histogram({
+	name: 'metacall_runtime_call_duration_seconds',
+	help: 'Function invocation duration in seconds.',
+	labelNames: ['function'],
+	buckets: client.exponentialBuckets(0.005, 2, 12),
+});
+const runtimeRemoteStatus = new client.Gauge({
+	name: 'metacall_runtime_remote_status',
+	help: 'Remote discovery endpoints by state.',
+	labelNames: ['state'],
+	collect() {
+		this.set({ state: 'loaded' }, remoteState.loaded.size);
+		this.set({ state: 'pending' }, remoteState.pending.size);
+		this.set({ state: 'failed' }, remoteState.failed.size);
+	},
+});
+const runtimeUptime = new client.Gauge({
+	name: 'metacall_runtime_uptime_seconds',
+	help: 'Runtime process uptime in seconds.',
+	collect() {
+		this.set(process.uptime());
+	},
+});
 
 if (!FUNCTION_CONFIG) {
 	console.error('[runtime] FUNCTION_CONFIG env var is required.');
@@ -330,6 +381,19 @@ app.use((req, _res, next) => {
 	console.log(`[runtime] ${req.method} ${req.url}`);
 	next();
 });
+app.use((req, res, next) => {
+	if (!req.path.startsWith('/call/') && !req.path.startsWith('/await/')) {
+		next();
+		return;
+	}
+	const started = process.hrtime.bigint();
+	res.once('finish', () => {
+		const elapsed = Number(process.hrtime.bigint() - started) / 1e9;
+		runtimeCalls.inc({ function: FUNCTION_NAME || 'unknown', status: String(res.statusCode) });
+		runtimeCallDuration.observe({ function: FUNCTION_NAME || 'unknown' }, elapsed);
+	});
+	next();
+});
 
 function readinessResponse(_req, res) {
 	res.status(localReady ? 200 : 503).json({
@@ -347,6 +411,14 @@ app.get('/health/live', (_req, res) => {
 app.get('/status', (_req, res) => {
 	res.json(publicRemoteState());
 });
+app.get('/metrics', async (_req, res, next) => {
+	try {
+		res.set('Content-Type', client.register.contentType);
+		res.end(await client.register.metrics());
+	} catch (err) {
+		next(err);
+	}
+});
 
 app.get('/inspect', (_req, res) => {
 	res.json(inspectData);
@@ -356,91 +428,133 @@ app.post('/call/:func', async (req, res) => {
 	const funcName = req.params.func;
 	const fn = functions[funcName];
 
-	if (!fn) {
-		return res.status(404).json({
-			error: `Function '${funcName}' not found in this Pod.`,
-			available: funcNames,
+	const ctx = opentelemetry.propagation.extract(opentelemetry.context.active(), req.headers);
+	return opentelemetry.context.with(ctx, () => {
+		return tracer.startActiveSpan('runtime.handleCall', async (span) => {
+			span.setAttribute('function_name', funcName);
+
+			if (!fn) {
+				span.setAttribute('http.status_code', 404);
+				span.end();
+				return res.status(404).json({
+					error: `Function '${funcName}' not found in this Pod.`,
+					available: funcNames,
+				});
+			}
+			
+			const parseSpan = tracer.startSpan('runtime.parseArgs');
+			const args = Array.isArray(req.body) ? req.body : (Array.isArray(req.body?.args) ? req.body.args : []);
+			parseSpan.end();
+
+			const timeout = setTimeout(() => {
+				if (!res.headersSent) {
+					span.setAttribute('http.status_code', 504);
+					res.status(504).json({
+						error: `Function '${funcName}' timed out after ${REQUEST_TIMEOUT_MS}ms`,
+					});
+				}
+			}, REQUEST_TIMEOUT_MS);
+
+			try {
+				const execSpan = tracer.startSpan('runtime.execution');
+				const result = fn(...args);
+				execSpan.end();
+
+				clearTimeout(timeout);
+
+				if (!res.headersSent) {
+					const serializeSpan = tracer.startSpan('runtime.serialization');
+					res.json(result);
+					serializeSpan.end();
+					span.setAttribute('http.status_code', 200);
+				}
+			} catch (err) {
+				clearTimeout(timeout);
+				span.recordException(err);
+				span.setAttribute('http.status_code', 500);
+
+				console.error(`[runtime] Error in ${funcName}(): ${err.message}`);
+				if (!res.headersSent) {
+					res.status(500).json({
+						error: err.message,
+						function: funcName,
+					});
+				}
+			}
+			span.end();
 		});
-	}
-	const args = Array.isArray(req.body) ? req.body : (Array.isArray(req.body?.args) ? req.body.args : []);
-	const timeout = setTimeout(() => {
-		if (!res.headersSent) {
-			res.status(504).json({
-				error: `Function '${funcName}' timed out after ${REQUEST_TIMEOUT_MS}ms`,
-			});
-		}
-	}, REQUEST_TIMEOUT_MS);
-
-	try {
-		const result = fn(...args);
-
-		clearTimeout(timeout);
-
-		if (!res.headersSent) {
-			res.json(result);
-		}
-	} catch (err) {
-		clearTimeout(timeout);
-
-		console.error(`[runtime] Error in ${funcName}(): ${err.message}`);
-		if (!res.headersSent) {
-			res.status(500).json({
-				error: err.message,
-				function: funcName,
-			});
-		}
-	}
+	});
 });
 
 app.post('/await/:func', async (req, res) => {
 	const funcName = req.params.func;
 	const fn = functions[funcName];
+	
+	const ctx = opentelemetry.propagation.extract(opentelemetry.context.active(), req.headers);
+	return opentelemetry.context.with(ctx, async () => {
+		return tracer.startActiveSpan('runtime.handleAwait', async (span) => {
+			span.setAttribute('function_name', funcName);
 
-	if (!fn) {
-		return res.status(404).json({
-			error: `Function '${funcName}' not found in this Pod.`,
-			available: funcNames,
+			if (!fn) {
+				span.setAttribute('http.status_code', 404);
+				span.end();
+				return res.status(404).json({
+					error: `Function '${funcName}' not found in this Pod.`,
+					available: funcNames,
+				});
+			}
+
+			const parseSpan = tracer.startSpan('runtime.parseArgs');
+			const args = Array.isArray(req.body) ? req.body : (Array.isArray(req.body?.args) ? req.body.args : []);
+			parseSpan.end();
+
+			const timeout = setTimeout(() => {
+				if (!res.headersSent) {
+					span.setAttribute('http.status_code', 504);
+					res.status(504).json({
+						error: `Async function '${funcName}' timed out after ${REQUEST_TIMEOUT_MS}ms`,
+					});
+				}
+			}, REQUEST_TIMEOUT_MS);
+
+			try {
+				const execSpan = tracer.startSpan('runtime.execution');
+				let result = fn(...args);
+
+				if (result && typeof result === 'object' && typeof result.then === 'function') {
+					result = await metacall_await(result);
+				}
+				execSpan.end();
+
+				clearTimeout(timeout);
+
+				if (!res.headersSent) {
+					const serializeSpan = tracer.startSpan('runtime.serialization');
+					res.json(result);
+					serializeSpan.end();
+					span.setAttribute('http.status_code', 200);
+				}
+			} catch (err) {
+				clearTimeout(timeout);
+				span.recordException(err);
+				span.setAttribute('http.status_code', 500);
+
+				console.error(`[runtime] Error in async ${funcName}(): ${err.message}`);
+				if (!res.headersSent) {
+					res.status(500).json({
+						error: err.message,
+						function: funcName,
+					});
+				}
+			}
+			span.end();
 		});
-	}
-
-	const args = Array.isArray(req.body) ? req.body : (Array.isArray(req.body?.args) ? req.body.args : []);
-
-	const timeout = setTimeout(() => {
-		if (!res.headersSent) {
-			res.status(504).json({
-				error: `Async function '${funcName}' timed out after ${REQUEST_TIMEOUT_MS}ms`,
-			});
-		}
-	}, REQUEST_TIMEOUT_MS);
-
-	try {
-		let result = fn(...args);
-
-		if (result && typeof result === 'object' && typeof result.then === 'function') {
-			result = await metacall_await(result);
-		}
-
-		clearTimeout(timeout);
-
-		if (!res.headersSent) {
-			res.json(result);
-		}
-	} catch (err) {
-		clearTimeout(timeout);
-
-		console.error(`[runtime] Error in async ${funcName}(): ${err.message}`);
-		if (!res.headersSent) {
-			res.status(500).json({
-				error: err.message,
-				function: funcName,
-			});
-		}
-	}
+	});
 });
 
 app.use((_req, res) => {
 	res.status(404).json({
-		error: 'Not found. Endpoints: GET /health, GET /inspect, POST /call/:func, POST /await/:func',
+		error: 'Not found. Endpoints: GET /health, GET /metrics, GET /inspect, POST /call/:func, POST /await/:func',
 	});
 });
 
@@ -466,6 +580,7 @@ server = app.listen(PORT, () => {
 	console.log(`[runtime]   GET  /health/ready      → readiness/startup probes`);
 	console.log(`[runtime]   GET  /health/live       → liveness probe`);
 	console.log(`[runtime]   GET  /status            → remote discovery state`);
+	console.log(`[runtime]   GET  /metrics           → Prometheus metrics`);
 	console.log(`[runtime]   GET  /inspect           → Mesh discovery`);
 	console.log(`[runtime]   POST /call/:func        → sync invocation`);
 	console.log(`[runtime]   POST /await/:func       → async invocation`);

@@ -45,9 +45,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	server := meshrouter.NewServer(kube, namespace)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	tp, err := meshrouter.InitTracer(ctx)
+	if err != nil {
+		ctrl.Log.Error(err, "unable to initialize tracer")
+	} else if tp != nil {
+		defer func() {
+			if err := tp.Shutdown(context.Background()); err != nil {
+				ctrl.Log.Error(err, "error shutting down tracer")
+			}
+		}()
+	}
+
+	server := meshrouter.NewServer(kube, namespace)
+
 	go server.SyncRegistry(ctx, refreshInterval)
 
 	ctrl.Log.Info("starting function-mesh router", "listen", listenAddr)

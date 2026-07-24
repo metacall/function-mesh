@@ -10,6 +10,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -348,6 +349,37 @@ func TestUpdateStatusTracksRemoteDiscovery(t *testing.T) {
 				t.Fatalf("unexpected remote failures: %v", got.Status.RemoteFailed)
 			}
 		})
+	}
+}
+
+func TestRuntimeResourcesDefaultsMissingValuesAndPreservesExplicitValues(t *testing.T) {
+	defaults := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("100m"),
+			corev1.ResourceMemory: resource.MustParse("128Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("500m"),
+			corev1.ResourceMemory: resource.MustParse("512Mi"),
+		},
+	}
+	explicit := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("250m")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
+	}
+
+	got := runtimeResources(explicit, defaults)
+	if got.Requests.Cpu().String() != "250m" {
+		t.Fatalf("explicit CPU request was overwritten: %s", got.Requests.Cpu().String())
+	}
+	if got.Requests.Memory().String() != "128Mi" {
+		t.Fatalf("missing memory request was not defaulted: %s", got.Requests.Memory().String())
+	}
+	if got.Limits.Cpu().String() != "500m" {
+		t.Fatalf("missing CPU limit was not defaulted: %s", got.Limits.Cpu().String())
+	}
+	if got.Limits.Memory().String() != "1Gi" {
+		t.Fatalf("explicit memory limit was overwritten: %s", got.Limits.Memory().String())
 	}
 }
 

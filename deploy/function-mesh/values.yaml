@@ -8,42 +8,81 @@ imagePullSecrets: []
 
 runtime:
   imageRepository: localhost:5000/metacall/function
+  defaultResources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
 
 operator:
   replicas: 1
   image:
     repository: localhost:5000/metacall/function-mesh-operator
     tag: dev
-    pullPolicy: IfNotPresent
-  resources: {}
+    pullPolicy: Always
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
 
 api:
   replicas: 1
   image:
     repository: localhost:5000/metacall/function-mesh-api
     tag: dev
-    pullPolicy: IfNotPresent
+    pullPolicy: Always
   service:
     type: ClusterIP
     port: 9000
   ingress:
     enabled: true
     host: api.metacall.localhost
-  resources: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
 
 router:
   replicas: 1
   image:
     repository: localhost:5000/metacall/function-mesh-router
     tag: dev
-    pullPolicy: IfNotPresent
+    pullPolicy: Always
   service:
     type: ClusterIP
     port: 9090
   ingress:
     enabled: true
     host: router.metacall.localhost
-  resources: {}
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+tracing:
+  enabled: true
+  endpoint: http://alloy.monitoring.svc.cluster.local:4318
+
+monitoring:
+  enabled: true
+  namespace: monitoring
+  serviceMonitors:
+    enabled: true
+  grafana:
+    ingress:
+      enabled: true
+      host: grafana.metacall.localhost
 
 cilium:
   enabled: true

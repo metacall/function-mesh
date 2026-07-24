@@ -9,8 +9,11 @@ import (
 	"net/http"
 	"reflect"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -23,9 +26,49 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	controllermetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	meshv1 "github.com/metacall/function-mesh/api/v1"
 )
+
+var (
+	functionReconcileTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "metacall_function_reconcile_total",
+		Help: "Total Function reconciliation attempts.",
+	}, []string{"function", "result"})
+	functionReconcileDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "metacall_function_reconcile_duration_seconds",
+		Help:    "Duration of Function reconciliation attempts.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"function"})
+	functionStatus = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "metacall_function_status",
+		Help: "Current Function phase (1 for the active phase).",
+	}, []string{"function", "phase"})
+	functionPodCount = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "metacall_function_pod_count",
+		Help: "Ready runtime pod count for a Function.",
+	}, []string{"function"})
+	functionRemoteLoaded = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "metacall_function_remote_loaded",
+		Help: "Remote endpoints loaded by a Function runtime.",
+	}, []string{"function"})
+	functionRemoteFailed = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "metacall_function_remote_failed",
+		Help: "Remote endpoints that failed to load for a Function runtime.",
+	}, []string{"function"})
+)
+
+func init() {
+	controllermetrics.Registry.MustRegister(
+		functionReconcileTotal,
+		functionReconcileDuration,
+		functionStatus,
+		functionPodCount,
+		functionRemoteLoaded,
+		functionRemoteFailed,
+	)
+}
 
 const (
 	LabelFunction    = "metacall.io/function"
@@ -43,19 +86,33 @@ const (
 
 type FunctionReconciler struct {
 	client.Client
-	Scheme                 *runtime.Scheme
-	RuntimeImageRepository string
-	RuntimeImagePullPolicy corev1.PullPolicy
-	HTTPClient             *http.Client
-	L7Visibility           bool
+	Scheme                  *runtime.Scheme
+	RuntimeImageRepository  string
+	RuntimeImagePullPolicy  corev1.PullPolicy
+	RuntimeDefaultResources corev1.ResourceRequirements
+	HTTPClient              *http.Client
+	L7Visibility            bool
+	TracingEnabled          bool
+	TracingEndpoint         string
 }
 
-func (r *FunctionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *FunctionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, reconcileErr error) {
+	started := time.Now()
+	reconcileResult := "success"
+	defer func() {
+		if reconcileErr != nil {
+			reconcileResult = "error"
+		}
+		functionReconcileTotal.WithLabelValues(req.Name, reconcileResult).Inc()
+		functionReconcileDuration.WithLabelValues(req.Name).Observe(time.Since(started).Seconds())
+	}()
 	logger := log.FromContext(ctx)
 
 	var function meshv1.Function
 	if err := r.Get(ctx, req.NamespacedName, &function); err != nil {
 		if apierrors.IsNotFound(err) {
+			reconcileResult = "not_found"
+			deleteFunctionMetrics(req.Name)
 			return ctrl.Result{}, r.reconcileAllEndpointMaps(ctx, req.Namespace)
 		}
 		return ctrl.Result{}, err
@@ -119,12 +176,23 @@ func (r *FunctionReconciler) reconcileDeployment(ctx context.Context, fn *meshv1
 		}
 		annotations := map[string]string{
 			AnnotationEndpointsHash: hashEndpoints(endpoints),
+			"prometheus.io/scrape":  "true",
+			"prometheus.io/port":    strconv.Itoa(int(defaultPort)),
+			"prometheus.io/path":    "/metrics",
 		}
 		if r.L7Visibility {
 			annotations["policy.cilium.io/proxy-visibility"] = "<Ingress/8080/TCP/HTTP>,<Egress/8080/TCP/HTTP>"
 		}
 		// hashing the endpoints to trigger a redeploy when the endpoints change
 		deployment.Spec.Template.Annotations = mergeLabels(deployment.Spec.Template.Annotations, annotations)
+
+		deployment.Spec.Template.Spec.DNSPolicy = corev1.DNSClusterFirst
+		deployment.Spec.Template.Spec.DNSConfig = &corev1.PodDNSConfig{
+			Options: []corev1.PodDNSConfigOption{
+				{Name: "ndots", Value: ptr.To("2")},
+				{Name: "single-request-reopen"},
+			},
+		}
 
 		deployment.Spec.Template.Spec.InitContainers = []corev1.Container{{
 			Name:            "stage-source",
@@ -157,7 +225,7 @@ func (r *FunctionReconciler) reconcileDeployment(ctx context.Context, fn *meshv1
 				{Name: "MESH_REMOTE_RETRY_DELAY_MS", Value: "2000"},
 				{Name: "MESH_REMOTE_HEALTH_TIMEOUT_MS", Value: "2000"},
 			},
-			Resources: fn.Spec.Runtime.Resources,
+			Resources: runtimeResources(fn.Spec.Runtime.Resources, r.RuntimeDefaultResources),
 			VolumeMounts: []corev1.VolumeMount{
 				{Name: "app-workdir", MountPath: "/app"},
 				{Name: "mesh-endpoints", MountPath: "/mesh", ReadOnly: true},
@@ -166,6 +234,12 @@ func (r *FunctionReconciler) reconcileDeployment(ctx context.Context, fn *meshv1
 			ReadinessProbe: httpProbe("/health/ready"),
 			LivenessProbe:  httpProbe("/health/live"),
 		}}
+		if r.TracingEnabled && r.TracingEndpoint != "" {
+			deployment.Spec.Template.Spec.Containers[0].Env = append(deployment.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{
+				Name:  "OTEL_EXPORTER_OTLP_ENDPOINT",
+				Value: r.TracingEndpoint,
+			})
+		}
 		deployment.Spec.Template.Spec.Volumes = []corev1.Volume{
 			{
 				Name: "source-code",
@@ -203,6 +277,11 @@ func (r *FunctionReconciler) reconcileService(ctx context.Context, fn *meshv1.Fu
 
 	mutate := func() error {
 		service.Labels = mergeLabels(service.Labels, functionLabels(fn))
+		service.Annotations = mergeLabels(service.Annotations, map[string]string{
+			"prometheus.io/scrape": "true",
+			"prometheus.io/port":   strconv.Itoa(int(defaultPort)),
+			"prometheus.io/path":   "/metrics",
+		})
 		service.Spec.Type = corev1.ServiceTypeClusterIP
 		service.Spec.Selector = selectorLabels(fn)
 		service.Spec.Ports = []corev1.ServicePort{{
@@ -344,6 +423,7 @@ func (r *FunctionReconciler) updateStatus(ctx context.Context, fn *meshv1.Functi
 			needsRequeue = true
 		}
 	}
+	updateFunctionMetrics(next)
 
 	if reflect.DeepEqual(fn.Status, next.Status) {
 		return needsRequeue, nil
@@ -353,6 +433,48 @@ func (r *FunctionReconciler) updateStatus(ctx context.Context, fn *meshv1.Functi
 	} else {
 		return needsRequeue, err
 	}
+}
+
+func updateFunctionMetrics(fn *meshv1.Function) {
+	functionStatus.DeletePartialMatch(prometheus.Labels{"function": fn.Name})
+	if fn.Status.Phase != "" {
+		functionStatus.WithLabelValues(fn.Name, fn.Status.Phase).Set(1)
+	}
+	functionPodCount.WithLabelValues(fn.Name).Set(float64(fn.Status.PodCount))
+	loaded := 0
+	if value, _, ok := strings.Cut(fn.Status.Remote, "/"); ok {
+		loaded, _ = strconv.Atoi(value)
+	}
+	functionRemoteLoaded.WithLabelValues(fn.Name).Set(float64(loaded))
+	functionRemoteFailed.WithLabelValues(fn.Name).Set(float64(len(fn.Status.RemoteFailed)))
+}
+
+func deleteFunctionMetrics(name string) {
+	functionStatus.DeletePartialMatch(prometheus.Labels{"function": name})
+	functionPodCount.DeleteLabelValues(name)
+	functionRemoteLoaded.DeleteLabelValues(name)
+	functionRemoteFailed.DeleteLabelValues(name)
+}
+
+func runtimeResources(explicit, defaults corev1.ResourceRequirements) corev1.ResourceRequirements {
+	out := explicit.DeepCopy()
+	if out.Requests == nil {
+		out.Requests = corev1.ResourceList{}
+	}
+	if out.Limits == nil {
+		out.Limits = corev1.ResourceList{}
+	}
+	for name, quantity := range defaults.Requests {
+		if _, exists := out.Requests[name]; !exists {
+			out.Requests[name] = quantity.DeepCopy()
+		}
+	}
+	for name, quantity := range defaults.Limits {
+		if _, exists := out.Limits[name]; !exists {
+			out.Limits[name] = quantity.DeepCopy()
+		}
+	}
+	return *out
 }
 
 type runtimeRemoteStatus struct {

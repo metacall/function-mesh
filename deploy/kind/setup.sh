@@ -52,6 +52,10 @@ cilium status --wait
 cilium hubble enable --ui
 cilium status --wait
 
+cilium upgrade --version "${CILIUM_VERSION}" --reuse-values \
+  --set 'hubble.metrics.enabled={dns:query;ignoreAAAA;labelsContext=source_namespace\,source_pod\,destination_namespace\,destination_pod,drop:labelsContext=source_namespace\,source_pod\,destination_namespace\,destination_pod,tcp:labelsContext=source_namespace\,source_pod\,destination_namespace\,destination_pod,flow:labelsContext=source_namespace\,source_pod\,destination_namespace\,destination_pod,icmp:labelsContext=source_namespace\,source_pod\,destination_namespace\,destination_pod,httpV2:labelsContext=source_namespace\,source_pod\,destination_namespace\,destination_pod\,traffic_direction}' \
+  --set hubble.metrics.enableOpenMetrics=true
+
 echo "Installing NGINX Ingress Controller..."
 kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
 

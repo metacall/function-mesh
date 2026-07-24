@@ -16,9 +16,16 @@ spec:
       labels:
         app.kubernetes.io/name: function-mesh-api
         metacall.io/component: api
-      {{- if and .Values.cilium.enabled .Values.cilium.hubble.l7Visibility }}
+      {{- if or .Values.monitoring.enabled (and .Values.cilium.enabled .Values.cilium.hubble.l7Visibility) }}
       annotations:
+        {{- if .Values.monitoring.enabled }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9000"
+        prometheus.io/path: /metrics
+        {{- end }}
+        {{- if and .Values.cilium.enabled .Values.cilium.hubble.l7Visibility }}
         policy.cilium.io/proxy-visibility: "<Ingress/9000/TCP/HTTP>,<Egress/9090/TCP/HTTP>"
+        {{- end }}
       {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
@@ -62,6 +69,12 @@ metadata:
   labels:
     app.kubernetes.io/name: function-mesh-api
     metacall.io/component: api
+  {{- if .Values.monitoring.enabled }}
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: {{ .Values.api.service.port | quote }}
+    prometheus.io/path: /metrics
+  {{- end }}
 spec:
   type: {{ .Values.api.service.type }}
   selector:

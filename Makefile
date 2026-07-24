@@ -1,6 +1,8 @@
 CLUSTER_NAME   ?= metacall-mesh
 HELM_RELEASE   ?= function-mesh
 HELM_CHART     ?= deploy/function-mesh
+MONITORING_RELEASE ?= monitoring
+MONITORING_NAMESPACE ?= monitoring
 
 OPERATOR_IMAGE ?= localhost:5000/metacall/function-mesh-operator:dev
 API_IMAGE      ?= localhost:5000/metacall/function-mesh-api:dev
@@ -118,6 +120,53 @@ hubble-ui:
 hubble-observe:
 	hubble observe --namespace metacall-functions
 
+## Deploy Prometheus, Grafana, Loki, Alloy, ServiceMonitors, and dashboards
+monitoring-install:
+	helm repo add prometheus-community https://prometheus-community.github.io/helm-charts --force-update
+	helm repo update prometheus-community
+	helm upgrade --install $(MONITORING_RELEASE) prometheus-community/kube-prometheus-stack \
+		--namespace $(MONITORING_NAMESPACE) --create-namespace \
+		--values deploy/monitoring/kube-prometheus-stack-values.yaml \
+		--wait --timeout 10m
+	kubectl apply -f deploy/monitoring/loki.yaml
+	kubectl apply -f deploy/monitoring/tempo.yaml
+	kubectl apply -f deploy/monitoring/alloy.yaml
+	kubectl apply -f deploy/monitoring/servicemonitors.yaml
+	kubectl apply -f deploy/monitoring/grafana-dashboard-configmap.yaml
+	kubectl -n $(MONITORING_NAMESPACE) rollout status statefulset/loki --timeout=5m
+	kubectl -n $(MONITORING_NAMESPACE) rollout status daemonset/alloy --timeout=5m
+
+## Forward Grafana to http://localhost:3000
+grafana-ui:
+	kubectl port-forward -n $(MONITORING_NAMESPACE) svc/$(MONITORING_RELEASE)-grafana 3000:80
+
+## Forward Prometheus to http://localhost:9090
+prometheus-ui:
+	kubectl port-forward -n $(MONITORING_NAMESPACE) svc/$(MONITORING_RELEASE)-kube-prometheus-prometheus 9090:9090
+
+## Delete Prometheus data while retaining the monitoring stack
+monitoring-reset-data:
+	kubectl -n $(MONITORING_NAMESPACE) patch prometheus $(MONITORING_RELEASE)-kube-prometheus-prometheus --type=merge -p '{"spec":{"replicas":0}}'
+	-kubectl -n $(MONITORING_NAMESPACE) wait --for=delete pod -l app.kubernetes.io/name=prometheus --timeout=180s
+	kubectl -n $(MONITORING_NAMESPACE) delete pvc -l app.kubernetes.io/name=prometheus
+	kubectl -n $(MONITORING_NAMESPACE) patch prometheus $(MONITORING_RELEASE)-kube-prometheus-prometheus --type=merge -p '{"spec":{"replicas":1}}'
+
+## Delete Loki log history while retaining the monitoring stack
+monitoring-reset-logs:
+	kubectl -n $(MONITORING_NAMESPACE) scale statefulset/loki --replicas=0
+	-kubectl -n $(MONITORING_NAMESPACE) wait --for=delete pod -l app.kubernetes.io/name=loki --timeout=180s
+	kubectl -n $(MONITORING_NAMESPACE) delete pvc -l app.kubernetes.io/name=loki
+	kubectl -n $(MONITORING_NAMESPACE) scale statefulset/loki --replicas=1
+	kubectl -n $(MONITORING_NAMESPACE) rollout status statefulset/loki --timeout=5m
+
+## Uninstall monitoring and remove its persisted data
+monitoring-clean:
+	-kubectl delete -f deploy/monitoring/alloy.yaml --ignore-not-found
+	-kubectl delete -f deploy/monitoring/loki.yaml --ignore-not-found
+	-helm uninstall $(MONITORING_RELEASE) -n $(MONITORING_NAMESPACE)
+	-kubectl delete pvc -n $(MONITORING_NAMESPACE) --all
+	-kubectl delete namespace $(MONITORING_NAMESPACE)
+
 # ──────────────────────────────────────────────────────────────
 #  6. Tests
 # ──────────────────────────────────────────────────────────────
@@ -141,5 +190,5 @@ test-api:
         docker-build docker-build-operator docker-build-api docker-build-router docker-build-runtime \
         docker-push docker-push-operator docker-push-api docker-push-router docker-push-runtime \
         deploy helm-install wait clean \
-        hubble-ui hubble-observe \
+        hubble-ui hubble-observe monitoring-install grafana-ui prometheus-ui monitoring-reset-data monitoring-reset-logs monitoring-clean \
         test test-controller test-router test-api

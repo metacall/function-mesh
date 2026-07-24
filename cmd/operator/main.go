@@ -4,6 +4,8 @@ import (
 	"flag"
 	"os"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -27,14 +29,26 @@ func main() {
 	var metricsAddr string
 	var probeAddr string
 	var runtimeImage string
+	var runtimeCPURequest string
+	var runtimeCPULimit string
+	var runtimeMemoryRequest string
+	var runtimeMemoryLimit string
 	var leaderElect bool
 	var l7Visibility bool
+	var tracingEnabled bool
+	var tracingEndpoint string
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.StringVar(&runtimeImage, "runtime-image", "localhost:5000/metacall/function", "Runtime image repository used for Function pods.")
+	flag.StringVar(&runtimeCPURequest, "runtime-cpu-request", "100m", "Default runtime CPU request.")
+	flag.StringVar(&runtimeCPULimit, "runtime-cpu-limit", "500m", "Default runtime CPU limit.")
+	flag.StringVar(&runtimeMemoryRequest, "runtime-memory-request", "128Mi", "Default runtime memory request.")
+	flag.StringVar(&runtimeMemoryLimit, "runtime-memory-limit", "512Mi", "Default runtime memory limit.")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "Enable leader election for controller manager.")
 	flag.BoolVar(&l7Visibility, "l7-visibility", false, "Enable L7 proxy visibility for Hubble.")
+	flag.BoolVar(&tracingEnabled, "tracing-enabled", false, "Enable OpenTelemetry tracing for function pods.")
+	flag.StringVar(&tracingEndpoint, "tracing-endpoint", "", "OpenTelemetry OTLP endpoint (e.g. http://alloy...:4318)")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -57,7 +71,19 @@ func main() {
 		Client:                 mgr.GetClient(),
 		Scheme:                 mgr.GetScheme(),
 		RuntimeImageRepository: runtimeImage,
-		L7Visibility:           l7Visibility,
+		RuntimeDefaultResources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse(runtimeCPURequest),
+				corev1.ResourceMemory: resource.MustParse(runtimeMemoryRequest),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse(runtimeCPULimit),
+				corev1.ResourceMemory: resource.MustParse(runtimeMemoryLimit),
+			},
+		},
+		L7Visibility: l7Visibility,
+		TracingEnabled: tracingEnabled,
+		TracingEndpoint: tracingEndpoint,
 	}).SetupWithManager(mgr); err != nil {
 		ctrl.Log.Error(err, "unable to create Function controller")
 		os.Exit(1)

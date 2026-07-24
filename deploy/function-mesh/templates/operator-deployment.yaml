@@ -15,9 +15,16 @@ spec:
       labels:
         app.kubernetes.io/name: function-mesh-operator
         metacall.io/component: operator
-      {{- if and .Values.cilium.enabled .Values.cilium.hubble.l7Visibility }}
+      {{- if or .Values.monitoring.enabled (and .Values.cilium.enabled .Values.cilium.hubble.l7Visibility) }}
       annotations:
+        {{- if .Values.monitoring.enabled }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+        {{- end }}
+        {{- if and .Values.cilium.enabled .Values.cilium.hubble.l7Visibility }}
         policy.cilium.io/proxy-visibility: "<Ingress/8080/TCP/HTTP>,<Ingress/8081/TCP/HTTP>,<Egress/8080/TCP/HTTP>"
+        {{- end }}
       {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
@@ -31,9 +38,17 @@ spec:
           imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
           args:
             - --runtime-image={{ .Values.runtime.imageRepository }}
+            - --runtime-cpu-request={{ .Values.runtime.defaultResources.requests.cpu }}
+            - --runtime-memory-request={{ .Values.runtime.defaultResources.requests.memory }}
+            - --runtime-cpu-limit={{ .Values.runtime.defaultResources.limits.cpu }}
+            - --runtime-memory-limit={{ .Values.runtime.defaultResources.limits.memory }}
             - --metrics-bind-address=:8080
             - --health-probe-bind-address=:8081
             - --l7-visibility={{ .Values.cilium.hubble.l7Visibility }}
+            {{- if .Values.tracing.enabled }}
+            - --tracing-enabled={{ .Values.tracing.enabled }}
+            - --tracing-endpoint={{ .Values.tracing.endpoint }}
+            {{- end }}
           ports:
             - name: metrics
               containerPort: 8080
@@ -51,3 +66,25 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: function-mesh-operator
+  namespace: {{ .Values.systemNamespace }}
+  labels:
+    app.kubernetes.io/name: function-mesh-operator
+    metacall.io/component: operator
+  {{- if .Values.monitoring.enabled }}
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: /metrics
+  {{- end }}
+spec:
+  selector:
+    app.kubernetes.io/name: function-mesh-operator
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: metrics

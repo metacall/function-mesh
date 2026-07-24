@@ -103,6 +103,38 @@ kubectl exec -it <pod-name> -n metacall-functions -- sh
 
 This project uses **Cilium** as the CNI plugin with `kubeProxyReplacement=true`. This allows cross-pod function calls via `rpc_loader` to be routed directly at the **eBPF kernel level**, bypassing standard `iptables` overhead for maximum performance.
 
+Install Prometheus, Grafana, Loki, and Grafana Alloy:
+```bash
+make monitoring-install
+```
+
+Open Grafana at <http://localhost:3000>:
+```bash
+make grafana-ui
+```
+
+The **Function Mesh Overview** dashboard contains metrics and a **Kubernetes Pod Logs** row. Use the `Log Namespace`, `Log Pod`, and `Log Container` selectors to view logs from any pod, or enter a regular expression in `Log Search` to filter messages. Logs are stored on a 10 GiB Loki PVC and retained for seven days.
+
+### Distributed Tracing (OpenTelemetry + Tempo)
+Function Mesh has built-in OpenTelemetry tracing for both the router and runtime pods. Traces are collected by Grafana Alloy and forwarded to **Grafana Tempo**, providing waterfall visualization of request phases (e.g. registry lookup, JSON parsing, function execution). 
+
+To view traces:
+1. Open Grafana and click the **Explore** icon in the sidebar (compass icon).
+2. Select **Tempo** from the data source dropdown.
+3. In the "Search" tab, select the `function-mesh-router` or `function-mesh-runtime` service name.
+4. Click **Run query** to see a list of recent traces, then click on a Trace ID to view the waterfall chart.
+
+By analyzing these spans, you can determine exactly how much time cross-pod requests spend in the native `rpc_loader` hop versus the router proxy and HTTP serialization layers.
+
+Useful monitoring commands:
+
+| Command | Description |
+|---|---|
+| `make prometheus-ui` | Open a local Prometheus port-forward on port 9090 |
+| `make monitoring-reset-data` | Delete persisted Prometheus metrics |
+| `make monitoring-reset-logs` | Delete persisted Loki logs |
+| `make monitoring-clean` | Uninstall monitoring and delete metrics/log PVCs |
+
 You can observe the live mesh network flows using Hubble. From your terminal, run:
 ```bash
 cilium hubble ui

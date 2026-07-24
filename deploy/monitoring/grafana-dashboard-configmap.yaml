@@ -1,0 +1,78 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: function-mesh-grafana-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  function-mesh.json: |
+    {
+      "annotations": {"list": []},
+      "description": "Function Mesh control-plane, runtime, resource, Hubble, and Kubernetes pod log telemetry.",
+      "editable": true,
+      "graphTooltip": 1,
+      "id": null,
+      "links": [],
+      "panels": [
+        {"type":"row","title":"Cluster Overview","id":1,"gridPos":{"h":1,"w":24,"x":0,"y":0},"collapsed":false,"panels":[]},
+        {"type":"stat","title":"Total Functions","id":2,"gridPos":{"h":5,"w":4,"x":0,"y":1},"targets":[{"expr":"count(kube_customresource_metacall_function_info)","refId":"A"}]},
+        {"type":"piechart","title":"Functions by Phase","id":3,"gridPos":{"h":5,"w":5,"x":4,"y":1},"targets":[{"expr":"sum by (phase) (kube_customresource_metacall_function_info)","legendFormat":"{{phase}}","refId":"A"}]},
+        {"type":"stat","title":"Running Function Pods","id":4,"gridPos":{"h":5,"w":3,"x":9,"y":1},"targets":[{"expr":"sum(kube_pod_status_phase{namespace=\"metacall-functions\",phase=\"Running\"})","refId":"A"}]},
+        {"type":"gauge","title":"Cluster CPU Used","id":5,"gridPos":{"h":5,"w":4,"x":12,"y":1},"fieldConfig":{"defaults":{"unit":"percent","min":0,"max":100}},"targets":[{"expr":"100 * sum(rate(node_cpu_seconds_total{mode!=\"idle\"}[5m])) / sum(rate(node_cpu_seconds_total[5m]))","refId":"A"}]},
+        {"type":"stat","title":"Function Mesh Memory Used","description":"Current container working-set memory in metacall-system and metacall-functions. This excludes duplicated kind node totals.","id":6,"gridPos":{"h":5,"w":4,"x":16,"y":1},"fieldConfig":{"defaults":{"unit":"bytes"}},"targets":[{"expr":"sum(container_memory_working_set_bytes{namespace=~\"metacall-system|metacall-functions\",container!=\"\",image!=\"\"})","refId":"A"}]},
+        {"type":"stat","title":"Managed PVC Storage Used","description":"Actual bytes used by persistent volumes in Function Mesh and monitoring namespaces. Node filesystem totals are intentionally excluded because kind exposes shared host-backed mounts on every node.","id":7,"gridPos":{"h":5,"w":4,"x":20,"y":1},"fieldConfig":{"defaults":{"unit":"bytes"}},"targets":[{"expr":"sum(kubelet_volume_stats_used_bytes{namespace=~\"metacall-system|metacall-functions|monitoring\"})","refId":"A"}]},
+
+        {"type":"row","title":"Function Mesh Control Plane","id":8,"gridPos":{"h":1,"w":24,"x":0,"y":6},"collapsed":false,"panels":[]},
+        {"type":"timeseries","title":"Reconcile Rate","id":9,"gridPos":{"h":7,"w":6,"x":0,"y":7},"targets":[{"expr":"sum by (result) (rate(metacall_function_reconcile_total[5m]))","legendFormat":"{{result}}","refId":"A"}]},
+        {"type":"timeseries","title":"Reconcile Latency p99","id":10,"gridPos":{"h":7,"w":6,"x":6,"y":7},"fieldConfig":{"defaults":{"unit":"s"}},"targets":[{"expr":"histogram_quantile(0.99, sum by (le) (rate(metacall_function_reconcile_duration_seconds_bucket[5m])))","refId":"A"}]},
+        {"type":"timeseries","title":"API Request Rate","id":11,"gridPos":{"h":7,"w":6,"x":12,"y":7},"targets":[{"expr":"sum by (method, path, status) (rate(metacall_api_request_total[5m]))","legendFormat":"{{method}} {{path}} {{status}}","refId":"A"}]},
+        {"type":"timeseries","title":"API Latency p99","id":12,"gridPos":{"h":7,"w":6,"x":18,"y":7},"fieldConfig":{"defaults":{"unit":"s"}},"targets":[{"expr":"histogram_quantile(0.99, sum by (le, path) (rate(metacall_api_request_duration_seconds_bucket[5m])))","legendFormat":"{{path}}","refId":"A"}]},
+        {"type":"timeseries","title":"Router Call Rate","id":13,"gridPos":{"h":7,"w":8,"x":0,"y":14},"targets":[{"expr":"sum by (function, status) (rate(metacall_call_total[5m]))","legendFormat":"{{function}} {{status}}","refId":"A"}]},
+        {"type":"timeseries","title":"Router Call Latency p99","id":14,"gridPos":{"h":7,"w":8,"x":8,"y":14},"fieldConfig":{"defaults":{"unit":"s"}},"targets":[{"expr":"histogram_quantile(0.99, sum by (le, function) (rate(metacall_call_duration_seconds_bucket[5m])))","legendFormat":"{{function}}","refId":"A"}]},
+        {"type":"timeseries","title":"Deploy Operations","id":15,"gridPos":{"h":7,"w":8,"x":16,"y":14},"targets":[{"expr":"sum by (operation, status) (rate(metacall_api_deploy_total[5m]))","legendFormat":"{{operation}} {{status}}","refId":"A"}]},
+
+        {"type":"row","title":"Per-Function Detail","id":16,"gridPos":{"h":1,"w":24,"x":0,"y":21},"collapsed":false,"panels":[]},
+        {"type":"timeseries","title":"Invocation Rate","id":17,"gridPos":{"h":7,"w":6,"x":0,"y":22},"targets":[{"expr":"sum by (status) (rate(metacall_runtime_call_total{function=~\"$function\"}[5m]))","legendFormat":"{{status}}","refId":"A"}]},
+        {"type":"timeseries","title":"Invocation Latency p99","id":18,"gridPos":{"h":7,"w":6,"x":6,"y":22},"fieldConfig":{"defaults":{"unit":"s"}},"targets":[{"expr":"histogram_quantile(0.99, sum by (le) (rate(metacall_runtime_call_duration_seconds_bucket{function=~\"$function\"}[5m])))","refId":"A"}]},
+        {"type":"timeseries","title":"Invocation Error Rate","id":19,"gridPos":{"h":7,"w":6,"x":12,"y":22},"targets":[{"expr":"sum(rate(metacall_runtime_call_total{function=~\"$function\",status!~\"2..\"}[5m]))","refId":"A"}]},
+        {"type":"stat","title":"Ready Pod Count","id":20,"gridPos":{"h":7,"w":6,"x":18,"y":22},"targets":[{"expr":"sum(metacall_function_pod_count{function=~\"$function\"})","refId":"A"}]},
+        {"type":"timeseries","title":"Remote Discovery State","id":21,"gridPos":{"h":7,"w":6,"x":0,"y":29},"targets":[{"expr":"sum by (state) (metacall_runtime_remote_status{pod=~\"$function.*\"})","legendFormat":"{{state}}","refId":"A"}]},
+        {"type":"timeseries","title":"Runtime CPU","id":22,"gridPos":{"h":7,"w":9,"x":6,"y":29},"fieldConfig":{"defaults":{"unit":"cores"}},"targets":[{"expr":"sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"metacall-functions\",container=\"runtime\",pod=~\"$function.*\"}[5m]))","legendFormat":"{{pod}}","refId":"A"}]},
+        {"type":"timeseries","title":"Runtime Memory","id":23,"gridPos":{"h":7,"w":9,"x":15,"y":29},"fieldConfig":{"defaults":{"unit":"bytes"}},"targets":[{"expr":"sum by (pod) (container_memory_working_set_bytes{namespace=\"metacall-functions\",container=\"runtime\",pod=~\"$function.*\"})","legendFormat":"{{pod}}","refId":"A"}]},
+
+        {"type":"row","title":"Resource Consumption","id":24,"gridPos":{"h":1,"w":24,"x":0,"y":36},"collapsed":false,"panels":[]},
+        {"type":"timeseries","title":"Runtime CPU: Usage / Requests / Limits","id":25,"gridPos":{"h":8,"w":8,"x":0,"y":37},"fieldConfig":{"defaults":{"unit":"cores"}},"targets":[{"expr":"sum(rate(container_cpu_usage_seconds_total{namespace=\"metacall-functions\",container=\"runtime\"}[5m]))","legendFormat":"usage","refId":"A"},{"expr":"sum(kube_pod_container_resource_requests{namespace=\"metacall-functions\",container=\"runtime\",resource=\"cpu\",unit=\"core\"})","legendFormat":"requests","refId":"B"},{"expr":"sum(kube_pod_container_resource_limits{namespace=\"metacall-functions\",container=\"runtime\",resource=\"cpu\",unit=\"core\"})","legendFormat":"limits","refId":"C"}]},
+        {"type":"timeseries","title":"Runtime Memory: Usage / Requests / Limits","id":26,"gridPos":{"h":8,"w":8,"x":8,"y":37},"fieldConfig":{"defaults":{"unit":"bytes"}},"targets":[{"expr":"sum(container_memory_working_set_bytes{namespace=\"metacall-functions\",container=\"runtime\"})","legendFormat":"usage","refId":"A"},{"expr":"sum(kube_pod_container_resource_requests{namespace=\"metacall-functions\",container=\"runtime\",resource=\"memory\",unit=\"byte\"})","legendFormat":"requests","refId":"B"},{"expr":"sum(kube_pod_container_resource_limits{namespace=\"metacall-functions\",container=\"runtime\",resource=\"memory\",unit=\"byte\"})","legendFormat":"limits","refId":"C"}]},
+        {"type":"timeseries","title":"Function Pod Network I/O","id":27,"gridPos":{"h":8,"w":8,"x":16,"y":37},"fieldConfig":{"defaults":{"unit":"Bps"}},"targets":[{"expr":"sum by (pod) (rate(container_network_receive_bytes_total{namespace=\"metacall-functions\"}[5m]))","legendFormat":"{{pod}} receive","refId":"A"},{"expr":"sum by (pod) (rate(container_network_transmit_bytes_total{namespace=\"metacall-functions\"}[5m]))","legendFormat":"{{pod}} transmit","refId":"B"}]},
+        {"type":"timeseries","title":"Persistent Volume Usage","id":28,"gridPos":{"h":7,"w":24,"x":0,"y":45},"fieldConfig":{"defaults":{"unit":"bytes"}},"targets":[{"expr":"kubelet_volume_stats_used_bytes","legendFormat":"{{namespace}}/{{persistentvolumeclaim}}","refId":"A"}]},
+
+        {"type":"row","title":"Hubble Network Flows","id":29,"gridPos":{"h":1,"w":24,"x":0,"y":52},"collapsed":false,"panels":[]},
+        {"type":"timeseries","title":"HTTP Request Rate to Functions","id":30,"gridPos":{"h":7,"w":8,"x":0,"y":53},"targets":[{"expr":"sum by (destination_pod, method) (rate(hubble_http_requests_total{destination_namespace=\"metacall-functions\",reporter=\"server\"}[5m]))","legendFormat":"{{destination_pod}} {{method}}","refId":"A"}]},
+        {"type":"timeseries","title":"HTTP Response Codes","id":31,"gridPos":{"h":7,"w":8,"x":8,"y":53},"targets":[{"expr":"sum by (destination_pod, status) (rate(hubble_http_requests_total{destination_namespace=\"metacall-functions\",reporter=\"server\"}[5m]))","legendFormat":"{{destination_pod}} {{status}}","refId":"A"}]},
+        {"type":"timeseries","title":"DNS Query Rate","id":32,"gridPos":{"h":7,"w":8,"x":16,"y":53},"targets":[{"expr":"sum by (source_pod, query) (rate(hubble_dns_queries_total{source_namespace=\"metacall-functions\"}[5m]))","legendFormat":"{{source_pod}} {{query}}","refId":"A"}]},
+        {"type":"timeseries","title":"Dropped Packets","id":33,"gridPos":{"h":7,"w":8,"x":0,"y":60},"targets":[{"expr":"sum by (reason) (rate(hubble_drop_total{source_namespace=\"metacall-functions\"}[5m]) or rate(hubble_drop_total{destination_namespace=\"metacall-functions\"}[5m]))","legendFormat":"{{reason}}","refId":"A"}]},
+        {"type":"timeseries","title":"TCP Flags","id":34,"gridPos":{"h":7,"w":8,"x":8,"y":60},"targets":[{"expr":"sum by (flag) (rate(hubble_tcp_flags_total{source_namespace=\"metacall-functions\"}[5m]) or rate(hubble_tcp_flags_total{destination_namespace=\"metacall-functions\"}[5m]))","legendFormat":"{{flag}}","refId":"A"}]},
+        {"type":"timeseries","title":"Observed Function Flow Rate","id":35,"gridPos":{"h":7,"w":8,"x":16,"y":60},"targets":[{"expr":"sum by (type, subtype) (rate(hubble_flows_processed_total{source_namespace=\"metacall-functions\"}[5m]) or rate(hubble_flows_processed_total{destination_namespace=\"metacall-functions\"}[5m]))","legendFormat":"{{type}} {{subtype}}","refId":"A"}]},
+
+        {"type":"row","title":"Kubernetes Pod Logs","id":36,"gridPos":{"h":1,"w":24,"x":0,"y":67},"collapsed":false,"panels":[]},
+        {"type":"logs","title":"Pod Logs","description":"Logs collected from every Kubernetes pod by Grafana Alloy and retained in Loki for seven days.","id":37,"gridPos":{"h":12,"w":24,"x":0,"y":68},"datasource":{"type":"loki","uid":"loki"},"options":{"showTime":true,"showLabels":false,"showCommonLabels":false,"wrapLogMessage":true,"prettifyLogMessage":false,"enableLogDetails":true,"dedupStrategy":"none","sortOrder":"Descending"},"targets":[{"datasource":{"type":"loki","uid":"loki"},"expr":"{namespace=~\"$log_namespace\", pod=~\"$log_pod\", container=~\"$log_container\"} |~ \"$log_search\"","queryType":"range","refId":"A"}]}
+      ],
+      "refresh": "30s",
+      "schemaVersion": 39,
+      "tags": ["function-mesh", "metacall"],
+      "templating": {
+        "list": [
+          {"name":"function","label":"Function","type":"query","datasource":{"type":"prometheus","uid":"prometheus"},"query":{"query":"label_values(metacall_function_pod_count, function)","refId":"FunctionVariable"},"includeAll":true,"allValue":".*","multi":true,"refresh":1},
+          {"name":"log_namespace","label":"Log Namespace","type":"query","datasource":{"type":"loki","uid":"loki"},"query":"label_values(namespace)","definition":"label_values(namespace)","includeAll":true,"allValue":".*","multi":true,"refresh":1},
+          {"name":"log_pod","label":"Log Pod","type":"query","datasource":{"type":"loki","uid":"loki"},"query":"label_values({namespace=~\"$log_namespace\"}, pod)","definition":"label_values({namespace=~\"$log_namespace\"}, pod)","includeAll":true,"allValue":".*","multi":true,"refresh":1},
+          {"name":"log_container","label":"Log Container","type":"query","datasource":{"type":"loki","uid":"loki"},"query":"label_values({namespace=~\"$log_namespace\", pod=~\"$log_pod\"}, container)","definition":"label_values({namespace=~\"$log_namespace\", pod=~\"$log_pod\"}, container)","includeAll":true,"allValue":".*","multi":true,"refresh":1},
+          {"name":"log_search","label":"Log Search","type":"textbox","query":"","current":{"selected":true,"text":"","value":""}}
+        ]
+      },
+      "time": {"from":"now-1h","to":"now"},
+      "timezone": "browser",
+      "title": "Function Mesh Overview",
+      "uid": "function-mesh-overview",
+      "version": 1
+    }
