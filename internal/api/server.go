@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -24,20 +25,28 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	meshv1 "github.com/metacall/function-mesh/api/v1"
+	meshplanner "github.com/metacall/function-mesh/internal/planner"
 )
 
 type Server struct {
-	Client     client.Client
-	Clientset  kubernetes.Interface
-	Namespace  string
-	RouterURL  string
-	WorkDir    string
-	HTTPClient *http.Client
+	Client            client.Client
+	Clientset         kubernetes.Interface
+	Namespace         string
+	RouterURL         string
+	WorkDir           string
+	HTTPClient        *http.Client
+	Planner           meshplanner.Runner
+	PlannerEnabled    bool
+	MaxConfigMapBytes int
+
+	deployLocks sync.Map
 
 	requests        *prometheus.CounterVec
 	requestDuration *prometheus.HistogramVec
 	deploys         *prometheus.CounterVec
 	activeFunctions prometheus.Gauge
+	plannerRuns     *prometheus.CounterVec
+	plannerDuration prometheus.Histogram
 	registry        *prometheus.Registry
 }
 
@@ -63,20 +72,32 @@ func NewServer(kube client.Client, clientset kubernetes.Interface, namespace, ro
 		Name: "metacall_api_active_functions",
 		Help: "Current number of Function resources managed by the API.",
 	})
-	registry.MustRegister(requests, requestDuration, deploys, activeFunctions)
+	plannerRuns := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "metacall_api_planner_runs_total",
+		Help: "Meta-AST planning runs by outcome.",
+	}, []string{"status"})
+	plannerDuration := prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "metacall_api_planner_duration_seconds",
+		Help:    "Duration of Meta-AST planning runs.",
+		Buckets: prometheus.DefBuckets,
+	})
+	registry.MustRegister(requests, requestDuration, deploys, activeFunctions, plannerRuns, plannerDuration)
 
 	return &Server{
-		Client:          kube,
-		Clientset:       clientset,
-		Namespace:       namespace,
-		RouterURL:       strings.TrimRight(routerURL, "/"),
-		WorkDir:         workDir,
-		HTTPClient:      &http.Client{Timeout: 60 * time.Second},
-		requests:        requests,
-		requestDuration: requestDuration,
-		deploys:         deploys,
-		activeFunctions: activeFunctions,
-		registry:        registry,
+		Client:            kube,
+		Clientset:         clientset,
+		Namespace:         namespace,
+		RouterURL:         strings.TrimRight(routerURL, "/"),
+		WorkDir:           workDir,
+		HTTPClient:        &http.Client{Timeout: 60 * time.Second},
+		requests:          requests,
+		requestDuration:   requestDuration,
+		deploys:           deploys,
+		activeFunctions:   activeFunctions,
+		plannerRuns:       plannerRuns,
+		plannerDuration:   plannerDuration,
+		MaxConfigMapBytes: defaultMaxConfigMapBytes,
+		registry:          registry,
 	}
 }
 
@@ -199,6 +220,7 @@ func (s *Server) handleRepositoryAdd(w http.ResponseWriter, r *http.Request) {
 		URL    string `json:"url"`
 		Branch string `json:"branch"`
 		Suffix string `json:"suffix"`
+		Plan   string `json:"plan"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -215,12 +237,12 @@ func (s *Server) handleRepositoryAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	defer cleanup()
 
-	deployed, err := s.deployFromSource(r.Context(), path, deploymentID)
+	result, err := s.deployFromSourceWithPlan(r.Context(), path, deploymentID, req.Plan)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"id": deploymentID, "deployment": deploymentID, "functions": deployed})
+	writeJSON(w, http.StatusCreated, map[string]any{"id": deploymentID, "deployment": deploymentID, "functions": result.Functions, "plan": result.Planning})
 }
 
 func (s *Server) handleBranchList(w http.ResponseWriter, r *http.Request) {
@@ -296,12 +318,12 @@ func (s *Server) handlePackageCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	defer cleanup()
 
-	deployed, err := s.deployFromSource(r.Context(), path, deploymentID)
+	result, err := s.deployFromSourceWithPlan(r.Context(), path, deploymentID, r.FormValue("plan"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"id": deploymentID, "deployment": deploymentID, "functions": deployed})
+	writeJSON(w, http.StatusCreated, map[string]any{"id": deploymentID, "deployment": deploymentID, "functions": result.Functions, "plan": result.Planning})
 }
 
 func (s *Server) handleDeployCreate(w http.ResponseWriter, r *http.Request) {
@@ -323,7 +345,7 @@ func (s *Server) handleDeployCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	suffix := sanitizeName(req.Suffix)
 	if req.Path != "" {
-		deployed, err := s.deployFromSource(r.Context(), req.Path, suffix)
+		result, err := s.deployFromSourceWithPlan(r.Context(), req.Path, suffix, req.Plan)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -332,7 +354,8 @@ func (s *Server) handleDeployCreate(w http.ResponseWriter, r *http.Request) {
 			"prefix":    hostname(),
 			"suffix":    suffix,
 			"version":   version(req.Version),
-			"functions": deployed,
+			"functions": result.Functions,
+			"plan":      result.Planning,
 		})
 		return
 	}
@@ -604,6 +627,10 @@ func (s *Server) extractPackage(r *http.Request) (string, func(), error) {
 	}
 	_ = out.Close()
 	if err := unzip(zipPath, dir); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	if err := os.Remove(zipPath); err != nil {
 		cleanup()
 		return "", nil, err
 	}

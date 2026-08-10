@@ -6,6 +6,7 @@ MONITORING_NAMESPACE ?= monitoring
 
 OPERATOR_IMAGE ?= localhost:5000/metacall/function-mesh-operator:dev
 API_IMAGE      ?= localhost:5000/metacall/function-mesh-api:dev
+META_AST_VERSION ?= 0.4.0
 ROUTER_IMAGE   ?= localhost:5000/metacall/function-mesh-router:dev
 RUNTIME_IMAGE  ?= localhost:5000/metacall/function
 LANG_RUNTIME   ?= metacall/core:latest
@@ -59,7 +60,7 @@ docker-build-operator:
 	docker build -f Dockerfile.operator -t $(OPERATOR_IMAGE) .
 
 docker-build-api:
-	docker build -f Dockerfile.api -t $(API_IMAGE) .
+	docker build --build-arg META_AST_VERSION=$(META_AST_VERSION) -f Dockerfile.api -t $(API_IMAGE) .
 
 docker-build-router:
 	docker build -f Dockerfile.router -t $(ROUTER_IMAGE) .
@@ -91,7 +92,8 @@ docker-push: docker-push-operator docker-push-api docker-push-router docker-push
 deploy: docker-build docker-push helm-install wait
 
 helm-install:
-	helm upgrade --install $(HELM_RELEASE) $(HELM_CHART)
+	helm upgrade --install $(HELM_RELEASE) $(HELM_CHART) \
+		--set-string api.planner.version=$(META_AST_VERSION)
 
 ## Wait for all control-plane deployments to be ready
 wait:

@@ -42,6 +42,15 @@ api:
   ingress:
     enabled: true
     host: api.metacall.localhost
+  planner:
+    enabled: true
+    version: '0.4.0'
+    binary: /usr/local/bin/meta-ast
+    timeout: 30s
+    maxOutputBytes: 5242880
+    maxInputFiles: 5000
+    maxInputBytes: 52428800
+    maxConfigMapBytes: 921600
   resources:
     requests:
       cpu: 100m

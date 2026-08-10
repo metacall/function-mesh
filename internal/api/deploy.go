@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -18,12 +20,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	meshv1 "github.com/metacall/function-mesh/api/v1"
+	"github.com/metacall/function-mesh/internal/sourcebundle"
 )
 
 const (
-	labelDeployGroup = "metacall.io/deploy-group"
-	labelComponent   = "metacall.io/component"
-	labelLanguage    = "metacall.io/language"
+	labelDeployGroup     = "metacall.io/deploy-group"
+	labelComponent       = "metacall.io/component"
+	labelLanguage        = "metacall.io/language"
+	annotationSourceHash = "metacall.io/source-hash"
 )
 
 var supportedLanguages = map[string]struct{}{
@@ -53,56 +57,11 @@ type metacallConfig struct {
 }
 
 func (s *Server) deployFromSource(ctx context.Context, sourcePath, deploymentID string) ([]DeployedFunction, error) {
-	configs, err := findMetaCallConfigs(sourcePath)
+	result, err := s.deployFromSourceWithPlan(ctx, sourcePath, deploymentID, PlanOff)
 	if err != nil {
 		return nil, err
 	}
-	if len(configs) == 0 {
-		return nil, fmt.Errorf("no metacall*.json files found")
-	}
-
-	deployed := make([]DeployedFunction, 0, len(configs))
-	seen := map[string]int{}
-	for _, configPath := range configs {
-		config, err := readMetaCallConfig(configPath)
-		if err != nil {
-			return nil, err
-		}
-		if config.LanguageID == "" {
-			return nil, fmt.Errorf("%s missing language_id", configPath)
-		}
-		if _, ok := supportedLanguages[config.LanguageID]; !ok {
-			return nil, fmt.Errorf("language %q is not supported by builder-cli/function-mesh", config.LanguageID)
-		}
-
-		baseName := sanitizeName(deploymentID + "-" + config.LanguageID)
-		seen[baseName]++
-		name := baseName
-		if seen[baseName] > 1 {
-			name = fmt.Sprintf("%s-%d", baseName, seen[baseName])
-		}
-		configMapName := name + "-code"
-		entrypoint := filepath.Base(configPath)
-
-		files, err := sourceFiles(configPath, config)
-		if err != nil {
-			return nil, err
-		}
-		if err := s.upsertSourceConfigMap(ctx, configMapName, deploymentID, config.LanguageID, files); err != nil {
-			return nil, err
-		}
-		if err := s.upsertFunction(ctx, name, deploymentID, config.LanguageID, configMapName, entrypoint); err != nil {
-			return nil, err
-		}
-
-		deployed = append(deployed, DeployedFunction{
-			Name:       name,
-			Language:   config.LanguageID,
-			ConfigMap:  configMapName,
-			Entrypoint: entrypoint,
-		})
-	}
-	return deployed, nil
+	return result.Functions, nil
 }
 
 func findMetaCallConfigs(root string) ([]string, error) {
@@ -116,6 +75,9 @@ func findMetaCallConfigs(root string) ([]string, error) {
 			case ".git", "node_modules", "__pycache__":
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
 			return nil
 		}
 		name := strings.ToLower(entry.Name())
@@ -157,15 +119,28 @@ func readMetaCallConfig(path string) (metacallConfig, error) {
 	return cfg, nil
 }
 
-func sourceFiles(configPath string, config metacallConfig) (map[string]string, error) {
+func sourceFiles(packageRoot, configPath string, config metacallConfig) (map[string]string, string, []string, map[string]any, error) {
+	packageRoot, err := filepath.Abs(packageRoot)
+	if err != nil {
+		return nil, "", nil, nil, err
+	}
+	configPath, err = filepath.Abs(configPath)
+	if err != nil {
+		return nil, "", nil, nil, err
+	}
 	configDir := filepath.Dir(configPath)
-	files := map[string]string{}
-	scripts := make([]string, 0, len(config.Scripts))
 	sourceRoot := filepath.Clean(filepath.Join(configDir, config.Path))
+	if _, err := relativeSourcePath(packageRoot, sourceRoot); err != nil {
+		return nil, "", nil, nil, fmt.Errorf("config source path %q: %w", config.Path, err)
+	}
+	if err := ensureContainedPath(packageRoot, sourceRoot, false); err != nil {
+		return nil, "", nil, nil, fmt.Errorf("config source path %q: %w", config.Path, err)
+	}
 
-	if err := filepath.WalkDir(sourceRoot, func(path string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
+	files := map[string]string{}
+	if err := filepath.WalkDir(sourceRoot, func(filePath string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
 		if entry.IsDir() {
 			switch entry.Name() {
@@ -174,78 +149,182 @@ func sourceFiles(configPath string, config metacallConfig) (map[string]string, e
 			}
 			return nil
 		}
-		data, err := os.ReadFile(path)
+		if entry.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		data, err := os.ReadFile(filePath)
 		if err != nil {
 			return err
 		}
-		// ConfigMap volume keys cannot preserve arbitrary nested paths. The
-		// current supported examples keep runtime files beside metacall.json.
-		files[filepath.Base(path)] = string(data)
+		relative, err := relativeSourcePath(packageRoot, filePath)
+		if err != nil {
+			return err
+		}
+		files[relative] = string(data)
 		return nil
 	}); err != nil {
-		return nil, err
+		return nil, "", nil, nil, err
 	}
 
-	// Search upward from the source directory toward the repo root for
-	// dependency manifests (package.json, requirements.txt, Gemfile) that
-	// the runtime's installDependencies() needs to run npm/pip/bundle install.
-	repoRoot := findRepoRoot(configDir)
+	// Dependency manifests may live above the configured source directory, but
+	// must never be read from outside the uploaded package root.
 	for dir := sourceRoot; ; dir = filepath.Dir(dir) {
 		for _, manifest := range depManifests {
 			if _, exists := files[manifest]; exists {
 				continue
 			}
 			candidate := filepath.Join(dir, manifest)
-			if data, err := os.ReadFile(candidate); err == nil {
-				files[manifest] = string(data)
+			if err := ensureContainedPath(packageRoot, candidate, true); err != nil {
+				continue
 			}
+			data, err := os.ReadFile(candidate)
+			if err != nil {
+				return nil, "", nil, nil, err
+			}
+			// The runtime installs dependencies from /app before loading the
+			// nested entrypoint, so keep the nearest manifest at bundle root.
+			files[manifest] = string(data)
 		}
-		if dir == repoRoot || dir == filepath.Dir(dir) {
+		if filepath.Clean(dir) == filepath.Clean(packageRoot) {
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
 			break
 		}
 	}
 
-	for _, script := range config.Scripts {
-		scriptPath := filepath.Clean(filepath.Join(configDir, config.Path, script))
-		key := filepath.Base(script)
-		if _, ok := files[key]; !ok {
-			data, err := os.ReadFile(scriptPath)
-			if err != nil {
-				return nil, err
-			}
-			files[key] = string(data)
-		}
-		scripts = append(scripts, key)
-	}
-
-	config.Raw["path"] = "."
-	config.Raw["scripts"] = scripts
-	rewritten, err := json.MarshalIndent(config.Raw, "", "  ")
+	sourceRootRelative, err := relativeSourcePath(packageRoot, sourceRoot)
 	if err != nil {
-		return nil, err
+		return nil, "", nil, nil, err
 	}
-	files[filepath.Base(configPath)] = string(rewritten) + "\n"
-	return files, nil
+	if sourceRootRelative == "" {
+		sourceRootRelative = "."
+	}
+	scripts := make([]string, 0, len(config.Scripts))
+	scriptPaths := make([]string, 0, len(config.Scripts))
+	for _, script := range config.Scripts {
+		normalizedScript, err := sourcebundle.NormalizePath(script)
+		if err != nil {
+			return nil, "", nil, nil, fmt.Errorf("invalid configured script %q: %w", script, err)
+		}
+		scriptPath := filepath.Join(sourceRoot, filepath.FromSlash(normalizedScript))
+		if err := ensureContainedPath(packageRoot, scriptPath, true); err != nil {
+			return nil, "", nil, nil, fmt.Errorf("configured script %q: %w", script, err)
+		}
+		packageRelative, err := relativeSourcePath(packageRoot, scriptPath)
+		if err != nil {
+			return nil, "", nil, nil, fmt.Errorf("configured script %q: %w", script, err)
+		}
+		if _, exists := files[packageRelative]; !exists {
+			data, readErr := os.ReadFile(scriptPath)
+			if readErr != nil {
+				return nil, "", nil, nil, readErr
+			}
+			files[packageRelative] = string(data)
+		}
+		scripts = append(scripts, normalizedScript)
+		scriptPaths = append(scriptPaths, packageRelative)
+	}
+	sort.Strings(scriptPaths)
+
+	rawData, err := json.Marshal(config.Raw)
+	if err != nil {
+		return nil, "", nil, nil, err
+	}
+	var rewrittenRaw map[string]any
+	if err := json.Unmarshal(rawData, &rewrittenRaw); err != nil {
+		return nil, "", nil, nil, err
+	}
+	rewrittenRaw["path"] = sourceRootRelative
+	rewrittenRaw["scripts"] = scripts
+	rewritten, err := json.MarshalIndent(rewrittenRaw, "", "  ")
+	if err != nil {
+		return nil, "", nil, nil, err
+	}
+	entrypoint, err := relativeSourcePath(packageRoot, configPath)
+	if err != nil {
+		return nil, "", nil, nil, err
+	}
+	files[entrypoint] = string(rewritten) + "\n"
+	return files, entrypoint, scriptPaths, rewrittenRaw, nil
 }
 
-func (s *Server) upsertSourceConfigMap(ctx context.Context, name, deploymentID, language string, files map[string]string) error {
+func relativeSourcePath(root, target string) (string, error) {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	targetAbs, err := filepath.Abs(target)
+	if err != nil {
+		return "", err
+	}
+	relative, err := filepath.Rel(rootAbs, targetAbs)
+	if err != nil {
+		return "", err
+	}
+	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return "", fmt.Errorf("path escapes package root")
+	}
+	if relative == "." {
+		return "", nil
+	}
+	return sourcebundle.NormalizePath(filepath.ToSlash(relative))
+}
+func ensureContainedPath(root, target string, requireRegular bool) error {
+	relative, err := relativeSourcePath(root, target)
+	if err != nil {
+		return err
+	}
+	current, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	var info os.FileInfo
+	if relative == "" {
+		info, err = os.Lstat(current)
+	} else {
+		for _, component := range strings.Split(filepath.FromSlash(relative), string(filepath.Separator)) {
+			current = filepath.Join(current, component)
+			info, err = os.Lstat(current)
+			if err != nil {
+				break
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("path contains a symbolic link")
+			}
+		}
+	}
+	if err != nil {
+		return err
+	}
+	if requireRegular && !info.Mode().IsRegular() {
+		return fmt.Errorf("path is not a regular file")
+	}
+	return nil
+}
+func (s *Server) upsertSourceConfigMap(ctx context.Context, name, deploymentID, language string, files map[string]string) (string, error) {
+	data, err := sourcebundle.Encode(files)
+	if err != nil {
+		return "", fmt.Errorf("encode source ConfigMap %s: %w", name, err)
+	}
 	var cm corev1.ConfigMap
 	key := types.NamespacedName{Name: name, Namespace: s.Namespace}
 	if err := s.Client.Get(ctx, key, &cm); err != nil && !apierrors.IsNotFound(err) {
-		return err
+		return "", err
 	} else if apierrors.IsNotFound(err) {
 		cm = corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.Namespace}}
 	}
 
-	_, err := controllerutil.CreateOrUpdate(ctx, s.Client, &cm, func() error {
+	_, err = controllerutil.CreateOrUpdate(ctx, s.Client, &cm, func() error {
 		cm.Labels = deployLabels(deploymentID, language, "source")
-		cm.Data = files
+		cm.Data = data
 		return nil
 	})
-	return err
+	return hashSourceData(data), err
 }
 
-func (s *Server) upsertFunction(ctx context.Context, name, deploymentID, language, configMap, entrypoint string) error {
+func (s *Server) upsertFunction(ctx context.Context, name, deploymentID, language, configMap, entrypoint, sourceHash string) error {
 	var fn meshv1.Function
 	key := types.NamespacedName{Name: name, Namespace: s.Namespace}
 	if err := s.Client.Get(ctx, key, &fn); err != nil && !apierrors.IsNotFound(err) {
@@ -256,6 +335,10 @@ func (s *Server) upsertFunction(ctx context.Context, name, deploymentID, languag
 
 	_, err := controllerutil.CreateOrUpdate(ctx, s.Client, &fn, func() error {
 		fn.Labels = deployLabels(deploymentID, language, "function")
+		if fn.Annotations == nil {
+			fn.Annotations = map[string]string{}
+		}
+		fn.Annotations[annotationSourceHash] = sourceHash
 		fn.Spec = meshv1.FunctionSpec{
 			Language:    language,
 			DeployGroup: deploymentID,
@@ -268,6 +351,22 @@ func (s *Server) upsertFunction(ctx context.Context, name, deploymentID, languag
 		return nil
 	})
 	return err
+}
+
+func hashSourceData(data map[string]string) string {
+	keys := make([]string, 0, len(data))
+	for key := range data {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	hash := sha256.New()
+	for _, key := range keys {
+		_, _ = hash.Write([]byte(key))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(data[key]))
+		_, _ = hash.Write([]byte{0})
+	}
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 func (s *Server) deleteDeployment(ctx context.Context, deploymentID string) error {

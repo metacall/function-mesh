@@ -61,8 +61,45 @@ func TestDeployFromSourceCreatesConfigMapAndFunction(t *testing.T) {
 	if fn.Spec.Language != "py" || fn.Spec.Source.ConfigMap != "demo-py-code" || fn.Spec.DeployGroup != "demo" {
 		t.Fatalf("unexpected function spec: %#v", fn.Spec)
 	}
+	if fn.Annotations[annotationSourceHash] == "" {
+		t.Fatalf("function is missing source hash annotation")
+	}
 }
 
+func TestSourceFilesPreservesNestedPathsAndRootDependencyManifest(t *testing.T) {
+	root := t.TempDir()
+	service := filepath.Join(root, "service")
+	if err := os.MkdirAll(service, 0o755); err != nil {
+		t.Fatalf("create service directory: %v", err)
+	}
+	configPath := filepath.Join(service, "metacall.json")
+	if err := os.WriteFile(configPath, []byte(`{"language_id":"py","path":".","scripts":["main.py"]}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(service, "main.py"), []byte("def main():\n    return 1\n"), 0o644); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(service, "requirements.txt"), []byte("requests==2.32.0\n"), 0o644); err != nil {
+		t.Fatalf("write requirements: %v", err)
+	}
+	config, err := readMetaCallConfig(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	files, entrypoint, scripts, rewritten, err := sourceFiles(root, configPath, config)
+	if err != nil {
+		t.Fatalf("collect source files: %v", err)
+	}
+	if entrypoint != "service/metacall.json" || len(scripts) != 1 || scripts[0] != "service/main.py" {
+		t.Fatalf("unexpected nested paths: entrypoint=%q scripts=%v", entrypoint, scripts)
+	}
+	if files["service/main.py"] == "" || files["requirements.txt"] == "" {
+		t.Fatalf("source or root dependency manifest missing: %#v", files)
+	}
+	if rewritten["path"] != "service" {
+		t.Fatalf("unexpected rewritten path: %#v", rewritten)
+	}
+}
 func TestDeployFromSourceRejectsUnsupportedLanguage(t *testing.T) {
 	source := t.TempDir()
 	if err := os.WriteFile(filepath.Join(source, "metacall.json"), []byte(`{

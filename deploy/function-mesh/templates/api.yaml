@@ -16,8 +16,8 @@ spec:
       labels:
         app.kubernetes.io/name: function-mesh-api
         metacall.io/component: api
-      {{- if or .Values.monitoring.enabled (and .Values.cilium.enabled .Values.cilium.hubble.l7Visibility) }}
       annotations:
+        metacall.io/meta-ast-version: {{ .Values.api.planner.version | quote }}
         {{- if .Values.monitoring.enabled }}
         prometheus.io/scrape: "true"
         prometheus.io/port: "9000"
@@ -26,7 +26,6 @@ spec:
         {{- if and .Values.cilium.enabled .Values.cilium.hubble.l7Visibility }}
         policy.cilium.io/proxy-visibility: "<Ingress/9000/TCP/HTTP>,<Egress/9090/TCP/HTTP>"
         {{- end }}
-      {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -45,6 +44,13 @@ spec:
             - --namespace={{ .Values.functionsNamespace }}
             - --router-url=http://function-mesh-router.{{ .Values.systemNamespace }}.svc.cluster.local:{{ .Values.router.service.port }}
             - --listen=:9000
+            - --planner-enabled={{ .Values.api.planner.enabled }}
+            - --planner-binary={{ .Values.api.planner.binary }}
+            - --planner-timeout={{ .Values.api.planner.timeout }}
+            - --planner-max-output-bytes={{ .Values.api.planner.maxOutputBytes | int64 }}
+            - --planner-max-input-files={{ .Values.api.planner.maxInputFiles | int }}
+            - --planner-max-input-bytes={{ .Values.api.planner.maxInputBytes | int64 }}
+            - --max-configmap-bytes={{ .Values.api.planner.maxConfigMapBytes | int64 }}
           ports:
             - name: http
               containerPort: 9000

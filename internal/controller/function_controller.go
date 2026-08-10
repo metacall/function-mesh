@@ -29,6 +29,7 @@ import (
 	controllermetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	meshv1 "github.com/metacall/function-mesh/api/v1"
+	"github.com/metacall/function-mesh/internal/sourcebundle"
 )
 
 var (
@@ -77,6 +78,7 @@ const (
 	LabelDeployGroup = "metacall.io/deploy-group"
 
 	AnnotationEndpointsHash = "metacall.io/endpoints-hash"
+	AnnotationSourceHash    = "metacall.io/source-hash"
 
 	defaultRuntimeImageRepository = "localhost:5000/metacall/function"
 	defaultRuntimeImagePullPolicy = corev1.PullIfNotPresent
@@ -160,6 +162,11 @@ func (r *FunctionReconciler) reconcileDeployment(ctx context.Context, fn *meshv1
 		deployment = appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: fn.Name, Namespace: fn.Namespace}}
 	}
 
+	sourceItems, indexedSource, sourceHash, err := r.sourceVolumeItems(ctx, fn)
+	if err != nil {
+		return err
+	}
+
 	mutate := func() error {
 		deployment.Labels = mergeLabels(deployment.Labels, functionLabels(fn))
 		replicas := int32(1)
@@ -176,6 +183,7 @@ func (r *FunctionReconciler) reconcileDeployment(ctx context.Context, fn *meshv1
 		}
 		annotations := map[string]string{
 			AnnotationEndpointsHash: hashEndpoints(endpoints),
+			AnnotationSourceHash:    sourceHash,
 			"prometheus.io/scrape":  "true",
 			"prometheus.io/port":    strconv.Itoa(int(defaultPort)),
 			"prometheus.io/path":    "/metrics",
@@ -240,12 +248,16 @@ func (r *FunctionReconciler) reconcileDeployment(ctx context.Context, fn *meshv1
 				Value: r.TracingEndpoint,
 			})
 		}
+		sourceVolume := corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: fn.Spec.Source.ConfigMap},
+		}
+		if indexedSource {
+			sourceVolume.Items = sourceItems
+		}
 		deployment.Spec.Template.Spec.Volumes = []corev1.Volume{
 			{
-				Name: "source-code",
-				VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{Name: fn.Spec.Source.ConfigMap},
-				}},
+				Name:         "source-code",
+				VolumeSource: corev1.VolumeSource{ConfigMap: &sourceVolume},
 			},
 			{
 				Name:         "app-workdir",
@@ -262,8 +274,40 @@ func (r *FunctionReconciler) reconcileDeployment(ctx context.Context, fn *meshv1
 		return controllerutil.SetControllerReference(fn, &deployment, r.Scheme)
 	}
 
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, &deployment, mutate)
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, &deployment, mutate)
 	return err
+}
+
+func (r *FunctionReconciler) sourceVolumeItems(ctx context.Context, fn *meshv1.Function) ([]corev1.KeyToPath, bool, string, error) {
+	var cm corev1.ConfigMap
+	key := types.NamespacedName{Name: fn.Spec.Source.ConfigMap, Namespace: fn.Namespace}
+	if err := r.Get(ctx, key, &cm); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, false, "", nil
+		}
+		return nil, false, "", err
+	}
+	items, indexed, err := sourcebundle.VolumeItems(cm.Data)
+	if err != nil {
+		return nil, false, "", fmt.Errorf("decode source ConfigMap %s: %w", cm.Name, err)
+	}
+	return items, indexed, hashConfigMapData(cm.Data), nil
+}
+
+func hashConfigMapData(data map[string]string) string {
+	keys := make([]string, 0, len(data))
+	for key := range data {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	hash := sha256.New()
+	for _, key := range keys {
+		_, _ = hash.Write([]byte(key))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(data[key]))
+		_, _ = hash.Write([]byte{0})
+	}
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 func (r *FunctionReconciler) reconcileService(ctx context.Context, fn *meshv1.Function) error {
@@ -405,6 +449,7 @@ func (r *FunctionReconciler) updateStatus(ctx context.Context, fn *meshv1.Functi
 			switch {
 			case len(remote.Failed) > 0:
 				next.Status.Phase = "Degraded"
+				needsRequeue = true
 			case remote.Live:
 				next.Status.Phase = "Live"
 			default:

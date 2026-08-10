@@ -88,6 +88,9 @@ spec:
         - name: Language
           type: string
           jsonPath: .spec.language
+        - name: Functions
+          type: string
+          jsonPath: .status.functions
         - name: Phase
           type: string
           jsonPath: .status.phase

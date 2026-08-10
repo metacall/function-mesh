@@ -291,11 +291,12 @@ func TestUpdateStatusTracksRemoteDiscovery(t *testing.T) {
 			wantRequeue: true,
 		},
 		{
-			name:       "degraded",
-			statusBody: `{"live":false,"total":2,"loaded":["http://peer-a/"],"pending":[],"failed":["http://peer-b/"]}`,
-			wantPhase:  "Degraded",
-			wantRemote: "1/2",
-			wantFailed: 1,
+			name:        "degraded",
+			statusBody:  `{"live":false,"total":2,"loaded":["http://peer-a/"],"pending":[],"failed":["http://peer-b/"]}`,
+			wantPhase:   "Degraded",
+			wantRemote:  "1/2",
+			wantFailed:  1,
+			wantRequeue: true,
 		},
 	}
 

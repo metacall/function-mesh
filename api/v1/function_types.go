@@ -37,6 +37,7 @@ type FunctionStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=fn
 // +kubebuilder:printcolumn:name="Language",type=string,JSONPath=`.spec.language`
+// +kubebuilder:printcolumn:name="Functions",type=string,JSONPath=`.status.functions`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Pods",type=integer,JSONPath=`.status.podCount`
 // +kubebuilder:printcolumn:name="Remote",type=string,JSONPath=`.status.remote`
