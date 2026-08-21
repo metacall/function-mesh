@@ -1,0 +1,84 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: function-mesh-operator
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    matchNames:
+      - metacall-system
+  selector:
+    matchLabels:
+      metacall.io/component: operator
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: function-mesh-api
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    matchNames:
+      - metacall-system
+  selector:
+    matchLabels:
+      metacall.io/component: api
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: function-mesh-router
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    matchNames:
+      - metacall-system
+  selector:
+    matchLabels:
+      metacall.io/component: router
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: function-mesh-runtime
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    matchNames:
+      - metacall-functions
+  selector:
+    matchLabels:
+      metacall.io/component: function
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: cilium-hubble
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    matchNames:
+      - kube-system
+  selector:
+    matchLabels:
+      k8s-app: hubble
+  endpoints:
+    - port: hubble-metrics
+      path: /metrics
+      interval: 30s

@@ -1,0 +1,100 @@
+grafana:
+  adminUser: admin
+  adminPassword: metacall
+  defaultDashboardsEnabled: true
+  additionalDataSources:
+    - name: Loki
+      uid: loki
+      type: loki
+      access: proxy
+      url: http://loki.monitoring.svc.cluster.local:3100
+      isDefault: false
+      jsonData:
+        maxLines: 2000
+    - name: Tempo
+      uid: tempo
+      type: tempo
+      access: proxy
+      url: http://tempo.monitoring.svc.cluster.local:3100
+      isDefault: false
+      jsonData:
+        tracesToLogsV2:
+          datasourceUid: loki
+          tags: ['pod', 'namespace']
+          filterByTraceID: false
+          filterBySpanID: false
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: ALL
+  grafana.ini:
+    auth.anonymous:
+      enabled: true
+      org_role: Admin
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    hosts:
+      - grafana.metacall.localhost
+    path: /
+
+prometheus:
+  prometheusSpec:
+    retention: 7d
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorNamespaceSelector: {}
+    podMonitorNamespaceSelector: {}
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 10Gi
+
+kube-state-metrics:
+  customResourceState:
+    enabled: true
+    config:
+      spec:
+        resources:
+          - groupVersionKind:
+              group: metacall.io
+              version: v1
+              kind: Function
+            metricNamePrefix: kube_customresource
+            labelsFromPath:
+              function_name:
+                - metadata
+                - name
+              namespace:
+                - metadata
+                - namespace
+            metrics:
+              - name: metacall_function_info
+                help: Information about a Function custom resource.
+                each:
+                  type: Info
+                  info:
+                    labelsFromPath:
+                      language:
+                        - spec
+                        - language
+                      deploy_group:
+                        - spec
+                        - deployGroup
+                      phase:
+                        - status
+                        - phase
+              - name: metacall_function_cr_pod_count
+                help: Ready pod count reported by Function status.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - podCount

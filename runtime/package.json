@@ -1,0 +1,18 @@
+{
+  "name": "@metacall/function-runtime",
+  "version": "1.0.0",
+  "description": "Pod runtime server for MetaCall Function Mesh. Loads one script via MetaCall Core and serves its functions over HTTP.",
+  "main": "server.js",
+  "scripts": {
+    "start": "metacall node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "prom-client": "^15.1.3",
+    "@opentelemetry/api": "^1.8.0",
+    "@opentelemetry/sdk-node": "^0.51.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.51.0",
+    "@opentelemetry/instrumentation-http": "^0.51.0",
+    "@opentelemetry/instrumentation-dns": "^0.31.0"
+  }
+}

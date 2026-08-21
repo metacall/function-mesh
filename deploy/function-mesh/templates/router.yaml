@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: function-mesh-router
+  namespace: {{ .Values.systemNamespace }}
+  labels:
+    app.kubernetes.io/name: function-mesh-router
+    metacall.io/component: router
+spec:
+  replicas: {{ .Values.router.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: function-mesh-router
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: function-mesh-router
+        metacall.io/component: router
+      {{- if or .Values.monitoring.enabled (and .Values.cilium.enabled .Values.cilium.hubble.l7Visibility) }}
+      annotations:
+        {{- if .Values.monitoring.enabled }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
+        {{- end }}
+        {{- if and .Values.cilium.enabled .Values.cilium.hubble.l7Visibility }}
+        policy.cilium.io/proxy-visibility: "<Ingress/9090/TCP/HTTP>,<Egress/8080/TCP/HTTP>"
+        {{- end }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: function-mesh-router
+      dnsPolicy: ClusterFirst
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "2"
+          - name: single-request-reopen
+      containers:
+        - name: router
+          image: "{{ .Values.router.image.repository }}:{{ .Values.router.image.tag }}"
+          imagePullPolicy: {{ .Values.router.image.pullPolicy }}
+          args:
+            - --namespace={{ .Values.functionsNamespace }}
+            - --listen=:9090
+          env:
+            {{- if .Values.tracing.enabled }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.tracing.endpoint | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 9090
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+          {{- with .Values.router.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: function-mesh-router
+  namespace: {{ .Values.systemNamespace }}
+  labels:
+    app.kubernetes.io/name: function-mesh-router
+    metacall.io/component: router
+  {{- if .Values.monitoring.enabled }}
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: {{ .Values.router.service.port | quote }}
+    prometheus.io/path: /metrics
+  {{- end }}
+spec:
+  type: {{ .Values.router.service.type }}
+  selector:
+    app.kubernetes.io/name: function-mesh-router
+  ports:
+    - name: http
+      port: {{ .Values.router.service.port }}
+      targetPort: http

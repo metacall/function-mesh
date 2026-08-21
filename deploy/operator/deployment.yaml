@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: function-mesh-operator
+  namespace: metacall-system
+  labels:
+    app.kubernetes.io/name: function-mesh-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: function-mesh-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: function-mesh-operator
+    spec:
+      serviceAccountName: function-mesh-operator
+      containers:
+        - name: manager
+          image: localhost:5000/metacall/function-mesh-operator:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - --runtime-image=localhost:5000/metacall/function
+            - --metrics-bind-address=:8080
+            - --health-probe-bind-address=:8081
+          ports:
+            - name: metrics
+              containerPort: 8080
+            - name: probes
+              containerPort: 8081
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: probes
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: probes

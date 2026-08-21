@@ -1,0 +1,704 @@
+package controller
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	controllermetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	meshv1 "github.com/metacall/function-mesh/api/v1"
+	"github.com/metacall/function-mesh/internal/sourcebundle"
+)
+
+var (
+	functionReconcileTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "metacall_function_reconcile_total",
+		Help: "Total Function reconciliation attempts.",
+	}, []string{"function", "result"})
+	functionReconcileDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "metacall_function_reconcile_duration_seconds",
+		Help:    "Duration of Function reconciliation attempts.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"function"})
+	functionStatus = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "metacall_function_status",
+		Help: "Current Function phase (1 for the active phase).",
+	}, []string{"function", "phase"})
+	functionPodCount = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "metacall_function_pod_count",
+		Help: "Ready runtime pod count for a Function.",
+	}, []string{"function"})
+	functionRemoteLoaded = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "metacall_function_remote_loaded",
+		Help: "Remote endpoints loaded by a Function runtime.",
+	}, []string{"function"})
+	functionRemoteFailed = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "metacall_function_remote_failed",
+		Help: "Remote endpoints that failed to load for a Function runtime.",
+	}, []string{"function"})
+)
+
+func init() {
+	controllermetrics.Registry.MustRegister(
+		functionReconcileTotal,
+		functionReconcileDuration,
+		functionStatus,
+		functionPodCount,
+		functionRemoteLoaded,
+		functionRemoteFailed,
+	)
+}
+
+const (
+	LabelFunction    = "metacall.io/function"
+	LabelLanguage    = "metacall.io/language"
+	LabelComponent   = "metacall.io/component"
+	LabelDeployGroup = "metacall.io/deploy-group"
+
+	AnnotationEndpointsHash = "metacall.io/endpoints-hash"
+	AnnotationSourceHash    = "metacall.io/source-hash"
+
+	defaultRuntimeImageRepository = "localhost:5000/metacall/function"
+	defaultRuntimeImagePullPolicy = corev1.PullIfNotPresent
+	defaultPort                   = int32(8080)
+	defaultEntrypoint             = "metacall.json"
+)
+
+type FunctionReconciler struct {
+	client.Client
+	Scheme                  *runtime.Scheme
+	RuntimeImageRepository  string
+	RuntimeImagePullPolicy  corev1.PullPolicy
+	RuntimeDefaultResources corev1.ResourceRequirements
+	HTTPClient              *http.Client
+	L7Visibility            bool
+	TracingEnabled          bool
+	TracingEndpoint         string
+}
+
+func (r *FunctionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, reconcileErr error) {
+	started := time.Now()
+	reconcileResult := "success"
+	defer func() {
+		if reconcileErr != nil {
+			reconcileResult = "error"
+		}
+		functionReconcileTotal.WithLabelValues(req.Name, reconcileResult).Inc()
+		functionReconcileDuration.WithLabelValues(req.Name).Observe(time.Since(started).Seconds())
+	}()
+	logger := log.FromContext(ctx)
+
+	var function meshv1.Function
+	if err := r.Get(ctx, req.NamespacedName, &function); err != nil {
+		if apierrors.IsNotFound(err) {
+			reconcileResult = "not_found"
+			deleteFunctionMetrics(req.Name)
+			return ctrl.Result{}, r.reconcileAllEndpointMaps(ctx, req.Namespace)
+		}
+		return ctrl.Result{}, err
+	}
+
+	if err := r.reconcileEndpointConfigMap(ctx, &function); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.reconcileDeployment(ctx, &function); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.reconcileService(ctx, &function); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.reconcileAllEndpointMaps(ctx, function.Namespace); err != nil {
+		return ctrl.Result{}, err
+	}
+	needsRequeue, err := r.updateStatus(ctx, &function)
+	if err != nil {
+		logger.Error(err, "failed to update Function status")
+		return ctrl.Result{}, err
+	}
+	if needsRequeue {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *FunctionReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&meshv1.Function{}).
+		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.Service{}).
+		Owns(&corev1.ConfigMap{}).
+		Complete(r)
+}
+
+func (r *FunctionReconciler) reconcileDeployment(ctx context.Context, fn *meshv1.Function) error {
+	var deployment appsv1.Deployment
+	key := types.NamespacedName{Name: fn.Name, Namespace: fn.Namespace}
+	if err := r.Get(ctx, key, &deployment); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	} else if apierrors.IsNotFound(err) {
+		deployment = appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: fn.Name, Namespace: fn.Namespace}}
+	}
+
+	sourceItems, indexedSource, sourceHash, err := r.sourceVolumeItems(ctx, fn)
+	if err != nil {
+		return err
+	}
+
+	mutate := func() error {
+		deployment.Labels = mergeLabels(deployment.Labels, functionLabels(fn))
+		replicas := int32(1)
+		if fn.Spec.Runtime.Replicas != nil {
+			replicas = *fn.Spec.Runtime.Replicas
+		}
+		deployment.Spec.Replicas = ptr.To(replicas)
+		deployment.Spec.Selector = &metav1.LabelSelector{MatchLabels: selectorLabels(fn)}
+		deployment.Spec.Template.Labels = mergeLabels(deployment.Spec.Template.Labels, functionLabels(fn))
+
+		endpoints, err := r.generateEndpoints(ctx, fn)
+		if err != nil {
+			return err
+		}
+		annotations := map[string]string{
+			AnnotationEndpointsHash: hashEndpoints(endpoints),
+			AnnotationSourceHash:    sourceHash,
+			"prometheus.io/scrape":  "true",
+			"prometheus.io/port":    strconv.Itoa(int(defaultPort)),
+			"prometheus.io/path":    "/metrics",
+		}
+		if r.L7Visibility {
+			annotations["policy.cilium.io/proxy-visibility"] = "<Ingress/8080/TCP/HTTP>,<Egress/8080/TCP/HTTP>"
+		}
+		// hashing the endpoints to trigger a redeploy when the endpoints change
+		deployment.Spec.Template.Annotations = mergeLabels(deployment.Spec.Template.Annotations, annotations)
+
+		deployment.Spec.Template.Spec.DNSPolicy = corev1.DNSClusterFirst
+		deployment.Spec.Template.Spec.DNSConfig = &corev1.PodDNSConfig{
+			Options: []corev1.PodDNSConfigOption{
+				{Name: "ndots", Value: ptr.To("2")},
+				{Name: "single-request-reopen"},
+			},
+		}
+
+		deployment.Spec.Template.Spec.InitContainers = []corev1.Container{{
+			Name:            "stage-source",
+			Image:           r.runtimeImage(fn),
+			ImagePullPolicy: r.imagePullPolicy(),
+			Command:         []string{"sh", "-c", "cp -R /source/. /app/"},
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "source-code", MountPath: "/source", ReadOnly: true},
+				{Name: "app-workdir", MountPath: "/app"},
+			},
+		}}
+		deployment.Spec.Template.Spec.Containers = []corev1.Container{{
+			Name:            "runtime",
+			Image:           r.runtimeImage(fn),
+			ImagePullPolicy: r.imagePullPolicy(),
+			Ports: []corev1.ContainerPort{{
+				Name:          "http",
+				ContainerPort: defaultPort,
+				Protocol:      corev1.ProtocolTCP,
+			}},
+			Env: []corev1.EnvVar{
+				{Name: "FUNCTION_NAME", Value: fn.Name},
+				{Name: "FUNCTION_CONFIG", Value: "/app/" + entrypoint(fn)},
+				{Name: "RPC_CONFIG", Value: "/mesh/metacall-rpc.json"},
+				{Name: "PORT", Value: fmt.Sprintf("%d", defaultPort)},
+				{Name: "METACALL_RPC_TIMEOUT_MS", Value: "5000"},
+				{Name: "METACALL_RPC_RETRY_COUNT", Value: "1"},
+				{Name: "METACALL_RPC_RETRY_DELAY_MS", Value: "0"},
+				{Name: "MESH_REMOTE_MAX_RETRIES", Value: "30"},
+				{Name: "MESH_REMOTE_RETRY_DELAY_MS", Value: "2000"},
+				{Name: "MESH_REMOTE_HEALTH_TIMEOUT_MS", Value: "2000"},
+			},
+			Resources: runtimeResources(fn.Spec.Runtime.Resources, r.RuntimeDefaultResources),
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "app-workdir", MountPath: "/app"},
+				{Name: "mesh-endpoints", MountPath: "/mesh", ReadOnly: true},
+			},
+			StartupProbe:   startupProbe(),
+			ReadinessProbe: httpProbe("/health/ready"),
+			LivenessProbe:  httpProbe("/health/live"),
+		}}
+		if r.TracingEnabled && r.TracingEndpoint != "" {
+			deployment.Spec.Template.Spec.Containers[0].Env = append(deployment.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{
+				Name:  "OTEL_EXPORTER_OTLP_ENDPOINT",
+				Value: r.TracingEndpoint,
+			})
+		}
+		sourceVolume := corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: fn.Spec.Source.ConfigMap},
+		}
+		if indexedSource {
+			sourceVolume.Items = sourceItems
+		}
+		deployment.Spec.Template.Spec.Volumes = []corev1.Volume{
+			{
+				Name:         "source-code",
+				VolumeSource: corev1.VolumeSource{ConfigMap: &sourceVolume},
+			},
+			{
+				Name:         "app-workdir",
+				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			},
+			{
+				Name: "mesh-endpoints",
+				VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: endpointsConfigMapName(fn.Name)},
+				}},
+			},
+		}
+		// wiring the deployment to the function
+		return controllerutil.SetControllerReference(fn, &deployment, r.Scheme)
+	}
+
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, &deployment, mutate)
+	return err
+}
+
+func (r *FunctionReconciler) sourceVolumeItems(ctx context.Context, fn *meshv1.Function) ([]corev1.KeyToPath, bool, string, error) {
+	var cm corev1.ConfigMap
+	key := types.NamespacedName{Name: fn.Spec.Source.ConfigMap, Namespace: fn.Namespace}
+	if err := r.Get(ctx, key, &cm); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, false, "", nil
+		}
+		return nil, false, "", err
+	}
+	items, indexed, err := sourcebundle.VolumeItems(cm.Data)
+	if err != nil {
+		return nil, false, "", fmt.Errorf("decode source ConfigMap %s: %w", cm.Name, err)
+	}
+	return items, indexed, hashConfigMapData(cm.Data), nil
+}
+
+func hashConfigMapData(data map[string]string) string {
+	keys := make([]string, 0, len(data))
+	for key := range data {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	hash := sha256.New()
+	for _, key := range keys {
+		_, _ = hash.Write([]byte(key))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(data[key]))
+		_, _ = hash.Write([]byte{0})
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func (r *FunctionReconciler) reconcileService(ctx context.Context, fn *meshv1.Function) error {
+	var service corev1.Service
+	key := types.NamespacedName{Name: fn.Name, Namespace: fn.Namespace}
+	if err := r.Get(ctx, key, &service); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	} else if apierrors.IsNotFound(err) {
+		service = corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: fn.Name, Namespace: fn.Namespace}}
+	}
+
+	mutate := func() error {
+		service.Labels = mergeLabels(service.Labels, functionLabels(fn))
+		service.Annotations = mergeLabels(service.Annotations, map[string]string{
+			"prometheus.io/scrape": "true",
+			"prometheus.io/port":   strconv.Itoa(int(defaultPort)),
+			"prometheus.io/path":   "/metrics",
+		})
+		service.Spec.Type = corev1.ServiceTypeClusterIP
+		service.Spec.Selector = selectorLabels(fn)
+		service.Spec.Ports = []corev1.ServicePort{{
+			Name:       "http",
+			Port:       defaultPort,
+			TargetPort: intstr.FromString("http"),
+			Protocol:   corev1.ProtocolTCP,
+		}}
+		return controllerutil.SetControllerReference(fn, &service, r.Scheme)
+	}
+
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, &service, mutate)
+	return err
+}
+
+func (r *FunctionReconciler) reconcileEndpointConfigMap(ctx context.Context, fn *meshv1.Function) error {
+	return r.upsertEndpointConfigMap(ctx, fn, fn)
+}
+
+func (r *FunctionReconciler) reconcileAllEndpointMaps(ctx context.Context, namespace string) error {
+	var list meshv1.FunctionList
+	if err := r.List(ctx, &list, client.InNamespace(namespace)); err != nil {
+		return err
+	}
+	for i := range list.Items {
+		fn := &list.Items[i]
+		if err := r.upsertEndpointConfigMap(ctx, fn, fn); err != nil {
+			return err
+		}
+		if err := r.reconcileDeployment(ctx, fn); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *FunctionReconciler) upsertEndpointConfigMap(ctx context.Context, owner *meshv1.Function, target *meshv1.Function) error {
+	var cm corev1.ConfigMap
+	key := types.NamespacedName{Name: endpointsConfigMapName(target.Name), Namespace: target.Namespace}
+	if err := r.Get(ctx, key, &cm); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	} else if apierrors.IsNotFound(err) {
+		cm = corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: endpointsConfigMapName(target.Name), Namespace: target.Namespace}}
+	}
+
+	mutate := func() error {
+		cm.Labels = mergeLabels(cm.Labels, functionLabels(target))
+		endpoints, err := r.generateEndpoints(ctx, target)
+		if err != nil {
+			return err
+		}
+		if endpoints == nil {
+			endpoints = []string{}
+		}
+		data := map[string]interface{}{
+			"urls": endpoints,
+		}
+		b, _ := json.Marshal(data)
+
+		cm.Data = map[string]string{
+			"endpoints.json":    string(b),
+			"metacall-rpc.json": rpcConfigJSON(),
+		}
+		return controllerutil.SetControllerReference(owner, &cm, r.Scheme)
+	}
+
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, &cm, mutate)
+	return err
+}
+
+func (r *FunctionReconciler) generateEndpoints(ctx context.Context, fn *meshv1.Function) ([]string, error) {
+	var list meshv1.FunctionList
+	if err := r.List(ctx, &list, client.InNamespace(fn.Namespace)); err != nil {
+		return nil, err
+	}
+
+	urls := make([]string, 0, len(list.Items))
+	for _, other := range list.Items {
+		if other.Name == fn.Name {
+			continue
+		}
+		if !sameDeployGroup(fn, &other) {
+			continue
+		}
+		urls = append(urls, serviceURL(&other))
+	}
+	sort.Strings(urls)
+	return urls, nil
+}
+
+func (r *FunctionReconciler) updateStatus(ctx context.Context, fn *meshv1.Function) (bool, error) {
+	var deployment appsv1.Deployment
+	if err := r.Get(ctx, types.NamespacedName{Name: fn.Name, Namespace: fn.Namespace}, &deployment); err != nil {
+		return false, err
+	}
+
+	next := fn.DeepCopy()
+	next.Status.ServiceURL = serviceURL(fn)
+	next.Status.PodCount = deployment.Status.ReadyReplicas
+	needsRequeue := deployment.Status.ReadyReplicas == 0
+	if deployment.Status.ReadyReplicas == 0 {
+		if fn.Spec.Runtime.Replicas != nil && *fn.Spec.Runtime.Replicas == 0 {
+			next.Status.Phase = "ScaledDown"
+			needsRequeue = false
+		} else {
+			next.Status.Phase = "Pending"
+		}
+		next.Status.Functions = nil
+		next.Status.Remote = ""
+		next.Status.RemoteFailed = nil
+	} else {
+		remote, err := r.fetchRemoteStatus(ctx, fn)
+		if err != nil {
+			next.Status.Phase = "Initializing"
+			next.Status.Remote = ""
+			next.Status.RemoteFailed = nil
+			needsRequeue = true
+		} else {
+			next.Status.Remote = fmt.Sprintf("%d/%d", len(remote.Loaded), remote.Total)
+			next.Status.RemoteFailed = append([]string(nil), remote.Failed...)
+			switch {
+			case len(remote.Failed) > 0:
+				next.Status.Phase = "Degraded"
+				needsRequeue = true
+			case remote.Live:
+				next.Status.Phase = "Live"
+			default:
+				next.Status.Phase = "Initializing"
+				needsRequeue = true
+			}
+		}
+	}
+
+	if deployment.Status.ReadyReplicas > 0 {
+		functions, err := r.inspectFunctions(ctx, fn)
+		if err == nil {
+			next.Status.Functions = functions
+		} else {
+			next.Status.Functions = nil
+			needsRequeue = true
+		}
+	}
+	updateFunctionMetrics(next)
+
+	if reflect.DeepEqual(fn.Status, next.Status) {
+		return needsRequeue, nil
+	}
+	if err := r.Status().Update(ctx, next); err != nil && apierrors.IsNotFound(err) {
+		return needsRequeue, nil
+	} else {
+		return needsRequeue, err
+	}
+}
+
+func updateFunctionMetrics(fn *meshv1.Function) {
+	functionStatus.DeletePartialMatch(prometheus.Labels{"function": fn.Name})
+	if fn.Status.Phase != "" {
+		functionStatus.WithLabelValues(fn.Name, fn.Status.Phase).Set(1)
+	}
+	functionPodCount.WithLabelValues(fn.Name).Set(float64(fn.Status.PodCount))
+	loaded := 0
+	if value, _, ok := strings.Cut(fn.Status.Remote, "/"); ok {
+		loaded, _ = strconv.Atoi(value)
+	}
+	functionRemoteLoaded.WithLabelValues(fn.Name).Set(float64(loaded))
+	functionRemoteFailed.WithLabelValues(fn.Name).Set(float64(len(fn.Status.RemoteFailed)))
+}
+
+func deleteFunctionMetrics(name string) {
+	functionStatus.DeletePartialMatch(prometheus.Labels{"function": name})
+	functionPodCount.DeleteLabelValues(name)
+	functionRemoteLoaded.DeleteLabelValues(name)
+	functionRemoteFailed.DeleteLabelValues(name)
+}
+
+func runtimeResources(explicit, defaults corev1.ResourceRequirements) corev1.ResourceRequirements {
+	out := explicit.DeepCopy()
+	if out.Requests == nil {
+		out.Requests = corev1.ResourceList{}
+	}
+	if out.Limits == nil {
+		out.Limits = corev1.ResourceList{}
+	}
+	for name, quantity := range defaults.Requests {
+		if _, exists := out.Requests[name]; !exists {
+			out.Requests[name] = quantity.DeepCopy()
+		}
+	}
+	for name, quantity := range defaults.Limits {
+		if _, exists := out.Limits[name]; !exists {
+			out.Limits[name] = quantity.DeepCopy()
+		}
+	}
+	return *out
+}
+
+type runtimeRemoteStatus struct {
+	Live    bool     `json:"live"`
+	Total   int      `json:"total"`
+	Loaded  []string `json:"loaded"`
+	Pending []string `json:"pending"`
+	Failed  []string `json:"failed"`
+}
+
+func (r *FunctionReconciler) fetchRemoteStatus(ctx context.Context, fn *meshv1.Function) (runtimeRemoteStatus, error) {
+	httpClient := r.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 2 * time.Second}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serviceURL(fn)+"status", nil)
+	if err != nil {
+		return runtimeRemoteStatus{}, err
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return runtimeRemoteStatus{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return runtimeRemoteStatus{}, fmt.Errorf("status returned %s", resp.Status)
+	}
+
+	var status runtimeRemoteStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return runtimeRemoteStatus{}, err
+	}
+	return status, nil
+}
+
+func (r *FunctionReconciler) inspectFunctions(ctx context.Context, fn *meshv1.Function) ([]string, error) {
+	httpClient := r.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 2 * time.Second}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serviceURL(fn)+"inspect", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("inspect returned %s", resp.Status)
+	}
+
+	var data map[string][]struct {
+		Scope struct {
+			Funcs []struct {
+				Name string `json:"name"`
+			} `json:"funcs"`
+		} `json:"scope"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, err
+	}
+
+	var names []string
+	for _, scripts := range data {
+		for _, script := range scripts {
+			for _, fn := range script.Scope.Funcs {
+				if fn.Name != "" {
+					names = append(names, fn.Name)
+				}
+			}
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func functionLabels(fn *meshv1.Function) map[string]string {
+	labels := selectorLabels(fn)
+	labels[LabelLanguage] = fn.Spec.Language
+	labels[LabelComponent] = "function"
+	labels["app.kubernetes.io/name"] = fn.Name
+	labels["app.kubernetes.io/instance"] = fn.Name
+	labels["app.kubernetes.io/component"] = fn.Spec.Language
+	if fn.Spec.DeployGroup != "" {
+		labels[LabelDeployGroup] = fn.Spec.DeployGroup
+		labels["app.kubernetes.io/part-of"] = fn.Spec.DeployGroup
+	}
+	return labels
+}
+
+func selectorLabels(fn *meshv1.Function) map[string]string {
+	return map[string]string{LabelFunction: fn.Name}
+}
+
+func mergeLabels(base map[string]string, values map[string]string) map[string]string {
+	out := make(map[string]string, len(base)+len(values))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range values {
+		out[k] = v
+	}
+	return out
+}
+
+func (r *FunctionReconciler) runtimeImage(fn *meshv1.Function) string {
+	repository := r.RuntimeImageRepository
+	if repository == "" {
+		repository = defaultRuntimeImageRepository
+	}
+	if fn.Spec.Language == "" {
+		return repository
+	}
+	return repository + ":" + fn.Spec.Language
+}
+
+func (r *FunctionReconciler) imagePullPolicy() corev1.PullPolicy {
+	if r.RuntimeImagePullPolicy != "" {
+		return r.RuntimeImagePullPolicy
+	}
+	return defaultRuntimeImagePullPolicy
+}
+
+func entrypoint(fn *meshv1.Function) string {
+	if fn.Spec.Source.Entrypoint != "" {
+		return fn.Spec.Source.Entrypoint
+	}
+	return defaultEntrypoint
+}
+
+func endpointsConfigMapName(name string) string {
+	return name + "-endpoints"
+}
+
+func serviceURL(fn *meshv1.Function) string {
+	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/", fn.Name, fn.Namespace, defaultPort)
+}
+
+func sameDeployGroup(a, b *meshv1.Function) bool {
+	if a.Spec.DeployGroup == "" {
+		return true
+	}
+	return a.Spec.DeployGroup == b.Spec.DeployGroup
+}
+
+func rpcConfigJSON() string {
+	return `{"language_id":"rpc","path":"/mesh","scripts":["endpoints.json"]}`
+}
+
+func hashEndpoints(endpoints []string) string {
+	if endpoints == nil {
+		endpoints = []string{}
+	}
+	data := map[string]interface{}{
+		"urls": endpoints,
+	}
+	b, _ := json.Marshal(data)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func httpProbe(path string) *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: path,
+				Port: intstr.FromString("http"),
+			},
+		},
+	}
+}
+
+func startupProbe() *corev1.Probe {
+	probe := httpProbe("/health/ready")
+	probe.PeriodSeconds = 5
+	probe.FailureThreshold = 60
+	return probe
+}
